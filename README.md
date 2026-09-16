@@ -76,6 +76,31 @@ capacitance, inductor losses and measurement noise), scores each run against
 the best match the hardware could reach, and prints a comparison with the v2.0
 search. Run it with `-v` to see the benchmark table.
 
+## Upgrading to v2.1
+
+See [CHANGELOG.md](CHANGELOG.md) for everything that changed. The short version
+for an existing tuner:
+
+1. **Flash** with `pio run -t upload`, or upload `firmware.bin` through the web
+   UI's firmware card. Do not update while transmitting: every relay releases
+   while the board reboots.
+2. **Check the boot log** for `Settings... migrated from v2.0`. Your
+   calibration, thresholds, display and Wi-Fi settings carry over. `relaymode`,
+   `latchms` and `spacing` no longer exist, and `samples` is raised to at least 8.
+3. **Recalibrate the bridge** ([SWR bridge calibration](#swr-bridge-calibration)).
+   This is required if you ever ran v2.0's `cal rev`, and recommended anyway,
+   because `revscale` has never been calibrated before.
+4. **Measure the relay settle time** ([Relay settle time](#relay-settle-time))
+   and set `settle` to the recommended value.
+5. **Optional:** select your CAT protocol explicitly (`cat kenwood`,
+   `cat flex`, ...), then set up CAT tune ([CAT tune](#cat-tune)) and USB
+   passthrough ([USB passthrough](#usb-passthrough)).
+6. **Check** with a tune on each band you use. The serial console prints the
+   result, the number of measurements and the time taken.
+
+If the TX request output is wired to your radio's TX inhibit input, read the
+note under [CAT tune](#cat-tune) before enabling it.
+
 ## Display auto-detection
 
 At boot the firmware scans I2C and picks a driver:
@@ -380,33 +405,70 @@ while it is connected.
 
 ## SWR bridge calibration
 
+The tuner's SWR and power readings, and therefore every tune and every
+protection decision, are only as good as this calibration. Do it after
+flashing v2.1, after any change to the bridge or its wiring, and whenever `raw`
+disagrees with a known-good wattmeter.
+
 Power formula:
 
 ```
 Vf = max(0, (fwdMv - fwdOffsetMv)) * fwdScale
+Vr = max(0, (revMv - revOffsetMv)) * revScale
 P  = (Vf / 1000)^2 / powerScale
+|Gamma| = Vr / Vf        SWR = (1 + |Gamma|) / (1 - |Gamma|)
 ```
 
-Use the wizard rather than doing this by hand:
+### What you need
 
-1. `power off` (so a mis-scaled reading cannot trip protection mid-calibration)
-2. With the transmitter **unkeyed**, `cal zero` — measures both detectors'
-   no-signal offsets
-3. Connect a 50 ohm dummy load, key a steady carrier at a known power, e.g. 25 W
-4. `cal fwd 25` — solves and saves `pwrscale`, then reports what it now reads
-5. Still into the dummy load, `cal rev` — reports the bridge's residual SWR.
-   It changes nothing; above about 1.1, adjust the bridge balance trimmer.
-6. Connect a known mismatch — a 100 ohm non-inductive load is SWR 2.0 — key the
-   same carrier and `cal rev 2.0`. This solves and saves `revscale`.
-7. `power on`
+- A 50 ohm dummy load rated for your calibration power.
+- A known mismatch: a **100 ohm non-inductive resistor load**, which is SWR 2.0.
+  Two 50 ohm dummy loads in series work, as does a 100 ohm carbon or thick-film
+  resistor on a short lead. A 25 ohm load, or two 50 ohm loads in parallel, is
+  also SWR 2.0.
+- A steady carrier at a known power: FM, or CW key-down. AM carrier power is
+  only a quarter of the rated power. 10–25 W is ideal.
+- An external wattmeter, if you have one, to confirm the power you calibrate
+  against.
+- Short, good-quality coax between the tuner's output and the loads. Cable loss
+  makes a mismatch look better than it is.
 
-Verify with `raw` at a few power levels. Diode detectors are non-linear, so
-calibrate near your normal operating power.
+### Procedure
 
-v2.0's `cal rev` wrote the reverse reading into a matched load as `revoffset`.
-That residual is bridge imbalance and diode leakage, which change with power, so
-it made SWR wrong at every other power level. If you calibrated with it, run
-`cal zero` again.
+Run these from the serial console or the web UI's console box:
+
+| Step | Command | Setup | What happens |
+|------|---------|-------|--------------|
+| 1 | `power off` | — | Stops a mis-scaled reading from tripping protection mid-calibration |
+| 2 | `auto off` | — | Stops auto-tune retuning into the 100 ohm load |
+| 3 | `bypass on` | — | The load must be seen directly, not through the L/C network |
+| 4 | `cal zero` | Transmitter **unkeyed** | Measures both detectors with no RF and saves `fwdoffset` and `revoffset`. Refuses if FWD reads over 150 mV. |
+| 5 | `cal fwd 25` | 50 ohm dummy load, key 25 W (use your actual power) | Solves and saves `pwrscale`, then prints what it now reads. It should say 25 W. |
+| 6 | `cal rev` | Same, still keyed into the dummy load | Changes nothing. Prints the bridge's residual SWR into a perfect load; see below. |
+| 7 | `cal rev 2.0` | 100 ohm load, key the same carrier | Solves and saves `revscale`, then prints the SWR it now reads. It should say 2.00. |
+| 8 | `bypass off`, `auto on`, `power on` | — | Back to normal |
+
+Each command takes about 100 ms and saves immediately. Unkey between steps.
+
+**Reading step 6.** Into a good 50 ohm load the reverse port should read almost
+nothing:
+
+- Below SWR 1.1: the bridge is well balanced.
+- 1.1–1.3: usable, but the tuner cannot tell apart matches better than this.
+  Adjust the bridge balance trimmer (if fitted) for minimum reverse reading.
+- Above 1.3: check the bridge toroid windings, the detector diodes, and that
+  FWD and REV are not swapped (`raw` should show FWD much larger than REV).
+
+**Check the result.** Key at a few power levels and run `raw` into both loads.
+Power should track your wattmeter, and SWR should stay near 1.0 and 2.0.
+Diode detectors are non-linear at low voltage, so readings drift at very low
+power; calibrate near the power you usually tune at, and keep `pwrmax` in the
+range you calibrated.
+
+**If you used v2.0's `cal rev`.** It saved the reverse reading into a matched
+load as `revoffset`. That reading is bridge imbalance and diode leakage, which
+grow with power, so SWR was wrong at every other power level. Steps 4 and 7
+replace both values.
 
 To adjust by hand instead:
 
@@ -414,13 +476,71 @@ To adjust by hand instead:
 set pwrscale 0.0294
 ```
 
-### Relay settle time
+```bash
+set revscale 1.05
+```
 
-`settle test` needs a steady carrier between `pwrmin` and `pwrmax`. It steps the
-capacitor bank away and back, records the detectors at the ADC's full rate, and
-reports how long each change took to settle (relay operate time plus contact
-bounce plus the detector's filter), with a recommended `settle` value. Too short
-a settle time makes the tuner judge each setting by the previous one's reading.
+## Relay settle time
+
+### What `settle` is
+
+Each time the tuner changes a relay combination it waits `settle` milliseconds
+before measuring. That wait has to cover:
+
+- the relay's operate or release time (typically 3–8 ms for small signal
+  relays),
+- contact bounce,
+- the RC filter on the detector outputs, which smooths RF ripple but also delays
+  the reading.
+
+If `settle` is **too short**, the tuner judges each setting partly by the
+previous setting's reading. The search then chases stale numbers, lands on
+worse matches and takes more steps. If it is **too long**, every tune is slower
+than it needs to be: a typical tune takes 25–35 measurements, so each extra
+millisecond of `settle` adds about 30 ms. The default is 15 ms. The only way to
+know the right value for your relays and detector filter is to measure it.
+
+### Running the test
+
+1. Connect the antenna or a dummy load, and key a steady carrier (FM or CW)
+   between `pwrmin` and `pwrmax`, e.g. 10–20 W.
+2. Run:
+
+   ```bash
+   settle test
+   ```
+
+3. Unkey when it finishes. It takes well under a second.
+
+The test moves the capacitor bank a large step (48 positions) away from the
+current setting and back. For each move it records the detectors at the ADC's
+full rate (a few hundred samples), finds the final |Γ|, and reports the last
+moment the reading was still outside a small band around that final value.
+Example output:
+
+```
+Away : |Gamma| 0.041 -> 0.512, settled in 9.8 ms (trace 131 ms, 0.22 ms/pair)
+Back : |Gamma| 0.509 -> 0.043, settled in 12.4 ms (trace 129 ms, 0.21 ms/pair)
+Current settle = 15 ms. Recommended: set settle 21
+```
+
+- **Away / Back**: the two directions. Release and operate times differ, so the
+  slower one sets the requirement.
+- **settled in**: time from the relay command to a stable reading.
+- **Recommended**: the slower direction plus 50% margin plus 2 ms. Apply it:
+
+  ```bash
+  set settle 21
+  ```
+
+It refuses to run while a tune or sweep is in progress, while a relay change is
+held for high RF, while protection is active, or when there is no carrier in the
+`pwrmin`–`pwrmax` window.
+
+Run it a few times; the figures should agree to within a couple of
+milliseconds. If they vary widely, the carrier is not steady (SSB, or ALC
+pumping). Rerun it after changing relays, the detector filter capacitors, or the
+power supply voltage (relays operate faster at higher coil voltage).
 
 ## Protection
 
@@ -566,7 +686,8 @@ whether polling is active.
 is enough to drive the MJD122 bases, and check the wiring to the PIC socket. If
 the console says the change is held, RF is above `pwrmax`.
 
-**Tune finds a poor match or wanders** — run `settle test` first; a settle time
+**Tune finds a poor match or wanders** — run `settle test` first
+([Relay settle time](#relay-settle-time)); a settle time
 that is too short is the most common cause. Then check calibration with
 `cal rev`: a bridge that reads SWR 1.3 into a dummy load limits every tune.
 
@@ -582,6 +703,7 @@ transmitting above `pwrmax`. Drop the power for a moment and it will retune.
 ATU-1000/
 ├── platformio.ini
 ├── README.md
+├── CHANGELOG.md             Version history
 ├── hardware.md              ESP32 to PIC socket pin mapping, hardware upgrades
 ├── license.md
 ├── include/
@@ -617,6 +739,7 @@ ATU-1000/
 
 ## See also
 
+- [CHANGELOG.md](CHANGELOG.md) — what changed in each version
 - [hardware.md](hardware.md) — detailed pin mapping, hardware notes and
   recommended hardware upgrades
 - [license.md](license.md)
