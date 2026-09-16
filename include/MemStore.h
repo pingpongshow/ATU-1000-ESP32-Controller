@@ -12,7 +12,8 @@
 //     stale ones and were evicted first. A monotonic use sequence is stored
 //     instead.
 //
-// Adds: per-band fallback and CSV import/export.
+// Adds: interpolation between neighbouring entries, per-band fallback and CSV
+// import/export.
 //
 
 #include <Arduino.h>
@@ -21,7 +22,9 @@
 #include <vector>
 
 #include "Config.h"
+#include "Network.h"
 #include "Settings.h"
+#include "Solver.h"
 #include "Types.h"
 
 namespace atu {
@@ -37,7 +40,17 @@ struct MemoryEntry {
   uint32_t lastUseSeq = 0;   // monotonic, survives reboots
 } __attribute__((packed));
 
-enum class MemHit : uint8_t { Miss, Exact, Near, Band };
+enum class MemHit : uint8_t { Miss, Exact, Near, Interp, Band };
+
+inline const char* memHitName(MemHit h) {
+  switch (h) {
+    case MemHit::Exact:
+    case MemHit::Near: return "MEM HIT";
+    case MemHit::Interp: return "MEM INTERP";
+    case MemHit::Band: return "MEM BAND";
+    default: return "MEM MISS";
+  }
+}
 
 struct MemLookup {
   MemHit hit = MemHit::Miss;
@@ -83,6 +96,8 @@ class MemoryStore {
       out.hit = (bestDist == 0) ? MemHit::Exact : MemHit::Near;
       return out;
     }
+
+    if (interpolate(freqHz, antenna, out)) return out;
 
     // Fall back to the nearest entry inside the same amateur band. Better than
     // nothing as a tuning seed, and never crosses a band edge.
@@ -222,6 +237,50 @@ class MemoryStore {
   uint32_t useSeq_ = 0;
 
   void markDirty() { dirty_ = true; dirtyMs_ = millis(); }
+
+  uint32_t centreHz(const MemoryEntry& e) const {
+    return e.bin * cfg_->memoryBinHz + cfg_->memoryBinHz / 2;
+  }
+
+  // Blends the nearest stored entries either side of freqHz. For a fixed load
+  // the matching reactances scale with frequency, so L*f and C*f are what vary
+  // smoothly between two tunes, not L and C themselves. Only entries on the
+  // same antenna, band and topology, and within memoryInterpHz of each other,
+  // are blended.
+  bool interpolate(uint32_t freqHz, uint8_t antenna, MemLookup& out) const {
+    if (cfg_->memoryInterpHz == 0) return false;
+    int band = findBandIndex(freqHz);
+    int lo = -1, hi = -1;
+    uint32_t loHz = 0, hiHz = UINT32_MAX;
+    for (size_t i = 0; i < entries_.size(); ++i) {
+      const MemoryEntry& e = entries_[i];
+      if (e.antenna != antenna || (e.flags & FLAG_BYPASS)) continue;
+      uint32_t hz = centreHz(e);
+      if (findBandIndex(hz) != band) continue;
+      if (hz <= freqHz && hz >= loHz) { lo = static_cast<int>(i); loHz = hz; }
+      if (hz >= freqHz && hz <= hiHz) { hi = static_cast<int>(i); hiHz = hz; }
+    }
+    if (lo < 0 || hi < 0 || lo == hi || hiHz <= loHz) return false;
+    if (hiHz - loHz > cfg_->memoryInterpHz) return false;
+    const MemoryEntry& a = entries_[lo];
+    const MemoryEntry& b = entries_[hi];
+    if ((a.flags & FLAG_TOPOLOGY) != (b.flags & FLAG_TOPOLOGY)) return false;
+
+    float t = static_cast<float>(freqHz - loHz) / static_cast<float>(hiHz - loHz);
+    float f = static_cast<float>(freqHz);
+    float lf = maskToUh(a.lMask) * loHz * (1.0f - t) + maskToUh(b.lMask) * hiHz * t;
+    float cf = static_cast<float>(maskToPf(a.cMask)) * loHz * (1.0f - t) +
+               static_cast<float>(maskToPf(b.cMask)) * hiHz * t;
+
+    out.state.lMask = nearestLMask(lf / f);
+    out.state.cMask = nearestCMask(cf / f);
+    out.state.topology = (a.flags & FLAG_TOPOLOGY) != 0;
+    out.state.bypass = false;
+    out.swrX100 = a.swrX100 > b.swrX100 ? a.swrX100 : b.swrX100;
+    out.bin = binFor(freqHz);
+    out.hit = MemHit::Interp;
+    return true;
+  }
 
   static void fill(MemLookup& out, const MemoryEntry& e) {
     out.state.lMask = e.lMask;

@@ -70,6 +70,7 @@ a{color:var(--ac)}h2{font-size:13px;text-transform:uppercase;letter-spacing:.7px
 <div class="card"><h2>Control</h2>
 <div class="row">
 <button class="p" onclick="cmd('tune')">Tune</button>
+<button onclick="cmd('tune cat')">CAT Tune</button>
 <button onclick="cmd('tune force')">Force Tune</button>
 <button onclick="cmd('abort')">Abort</button>
 <button onclick="cmd('bypass on')">Bypass On</button>
@@ -109,10 +110,13 @@ $('st').textContent=d.tuning?('TUNING '+d.pct+'%'):d.status;
 $('disp').textContent='Display: '+d.disp;$('cat').textContent='CAT: '+d.cat;
 $('mode').textContent=d.auto?'AUTO':'MANUAL';auto=d.auto;
 $('up').textContent=Math.floor(d.up/60)+'m  '+d.temp;
-let a='';if(d.ovl)a='<div class="al e">POWER OVERLOAD - bypass engaged</div>';
+let a='';if(d.hold)a='<div class="al e">PROTECTION - TX inhibit asserted, RF still present, holding match</div>';
+else if(d.ovl)a='<div class="al e">PROTECTION - TX inhibit, bypass engaged</div>';
 else if(d.tlvl==3)a='<div class="al e">OVER TEMPERATURE - bypass engaged</div>';
 else if(d.tlvl==2)a='<div class="al w">HOT - transmit inhibited</div>';
+else if(d.swra)a='<div class="al w">High SWR</div>';
 else if(d.warn)a='<div class="al w">Power warning</div>';
+if(d.pend)a+='<div class="al w">Relay change held until RF drops</div>';
 $('alert').innerHTML=a;}catch(e){}}
 async function cmd(c){const r=await fetch('/api/cmd?c='+encodeURIComponent(c));$('out').textContent=await r.text();poll()}
 function run(){const v=$('ci').value.trim();if(v){cmd(v);$('ci').value=''}}
@@ -126,8 +130,11 @@ class WebUi {
  public:
   void begin(Settings* settings) { cfg_ = settings; }
 
+  // Starts connecting and returns straight away; loop() finishes the job.
+  // The old version sat in a delay() loop for up to 15 s, during which nothing
+  // else in the firmware ran.
   bool start(Print& log) {
-    if (running_) return true;
+    if (running_ || connecting_) return true;
     if (cfg_->wifiSsid[0] == '\0' && !cfg_->wifiApFallback) {
       log.println("No SSID configured; use 'wifi <ssid> <pass>'");
       return false;
@@ -139,55 +146,50 @@ class WebUi {
     if (cfg_->wifiSsid[0] != '\0') {
       WiFi.mode(WIFI_STA);
       WiFi.begin(cfg_->wifiSsid, cfg_->wifiPass);
-      log.printf("Connecting to '%s'", cfg_->wifiSsid);
-      uint32_t t0 = millis();
-      while (WiFi.status() != WL_CONNECTED && elapsed(t0) < 15000) {
-        delay(250);
-        log.print(".");
-      }
-      log.println();
+      log.printf("Connecting to '%s' in the background...\n", cfg_->wifiSsid);
+      connecting_ = true;
+      connectStartMs_ = millis();
+      return true;
     }
-
-    if (WiFi.status() == WL_CONNECTED) {
-      apMode_ = false;
-      log.printf("Connected, IP %s\n", WiFi.localIP().toString().c_str());
-    } else if (cfg_->wifiApFallback) {
-      WiFi.mode(WIFI_AP);
-      char ssid[36];
-      snprintf(ssid, sizeof(ssid), "%s-setup", cfg_->hostname);
-      WiFi.softAP(ssid);
-      apMode_ = true;
-      log.printf("Access point '%s', IP %s\n", ssid, WiFi.softAPIP().toString().c_str());
-    } else {
-      log.println("Wi-Fi connection failed");
-      WiFi.mode(WIFI_OFF);
-      return false;
-    }
-
-    if (MDNS.begin(cfg_->hostname)) {
-      MDNS.addService("http", "tcp", 80);
-      log.printf("Reachable at http://%s.local/\n", cfg_->hostname);
-    }
-
-    routes();
-    server_.begin();
-    running_ = true;
+    startAp();
     return true;
   }
 
   void stop() {
-    if (!running_) return;
-    server_.stop();
-    MDNS.end();
+    if (!running_ && !connecting_) return;
+    if (running_) {
+      server_.stop();
+      MDNS.end();
+    }
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     running_ = false;
+    connecting_ = false;
     apMode_ = false;
   }
 
   void loop() {
+    if (connecting_) {
+      if (WiFi.status() == WL_CONNECTED) {
+        connecting_ = false;
+        apMode_ = false;
+        Serial.printf("Wi-Fi connected, IP %s\n", WiFi.localIP().toString().c_str());
+        startServer();
+      } else if (elapsed(connectStartMs_) >= kConnectTimeoutMs) {
+        connecting_ = false;
+        if (cfg_->wifiApFallback) {
+          Serial.println("Wi-Fi connection failed, starting access point");
+          startAp();
+        } else {
+          Serial.println("Wi-Fi connection failed");
+          WiFi.mode(WIFI_OFF);
+        }
+      }
+    }
     if (running_) server_.handleClient();
   }
+
+  bool connecting() const { return connecting_; }
 
   bool running() const { return running_; }
   bool up() const {
@@ -200,10 +202,39 @@ class WebUi {
   bool apMode() const { return apMode_; }
 
  private:
+  static constexpr uint32_t kConnectTimeoutMs = 15000;
+
   Settings* cfg_ = nullptr;
   WebServer server_{80};
   bool running_ = false;
+  bool connecting_ = false;
   bool apMode_ = false;
+  bool routesAdded_ = false;
+  uint32_t connectStartMs_ = 0;
+
+  void startAp() {
+    WiFi.mode(WIFI_AP);
+    char ssid[36];
+    snprintf(ssid, sizeof(ssid), "%s-setup", cfg_->hostname);
+    WiFi.softAP(ssid);
+    apMode_ = true;
+    Serial.printf("Access point '%s', IP %s\n", ssid, WiFi.softAPIP().toString().c_str());
+    startServer();
+  }
+
+  void startServer() {
+    if (MDNS.begin(cfg_->hostname)) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.printf("Reachable at http://%s.local/\n", cfg_->hostname);
+    }
+    if (!routesAdded_) {
+      routes();
+      routesAdded_ = true;
+    }
+    server_.begin();
+    running_ = true;
+    Serial.printf("Web UI: http://%s/\n", ip().c_str());
+  }
 
   void routes() {
     server_.on("/", HTTP_GET, [this]() {
@@ -279,9 +310,10 @@ class WebUi {
   void sendStatus() {
     App& a = gApp;
     Settings& c = a.cfg();
-    char buf[640];
+    char buf[720];
     snprintf(buf, sizeof(buf),
              "{\"freq\":%lu,\"band\":\"%s\",\"swr\":%.2f,\"pw\":%.1f,\"valid\":%s,"
+             "\"swra\":%s,\"hold\":%s,\"pend\":%s,\"cattune\":%s,"
              "\"l\":%.2f,\"c\":%u,\"topo\":%s,\"byp\":%s,\"auto\":%s,"
              "\"status\":\"%s\",\"cat\":\"%s\",\"disp\":\"%s\","
              "\"tuning\":%s,\"pct\":%u,\"sweep\":%s,"
@@ -292,6 +324,10 @@ class WebUi {
              a.reading.valid ? a.reading.swr : 0.0f,
              a.reading.powerW,
              a.reading.valid ? "true" : "false",
+             a.swrAlarm ? "true" : "false",
+             (a.protectState == ProtectState::WaitRfDrop) ? "true" : "false",
+             a.relayPending ? "true" : "false",
+             a.catTune.active() ? "true" : "false",
              a.relays.totalL(), static_cast<unsigned>(a.relays.totalC()),
              a.state.topology ? "true" : "false",
              a.state.bypass ? "true" : "false",
@@ -329,6 +365,7 @@ inline bool cmdWifi(const char* args, Print& out) {
 
   if (!*args || !strcasecmp(args, "status")) {
     out.printf("Wi-Fi: %s\n", gWeb.up() ? (gWeb.apMode() ? "access point" : "connected")
+                                        : gWeb.connecting() ? "connecting"
                                         : (c.wifiEnabled ? "down" : "disabled"));
     out.printf("SSID    : %s\n", c.wifiSsid[0] ? c.wifiSsid : "<not set>");
     out.printf("Hostname: %s\n", c.hostname);
@@ -343,7 +380,8 @@ inline bool cmdWifi(const char* args, Print& out) {
     c.wifiEnabled = true;
     a.settingsStore.save();
     if (!gWeb.start(out)) out.println("Failed to bring Wi-Fi up");
-    else out.printf("Web UI at http://%s/\n", gWeb.ip().c_str());
+    else if (gWeb.up()) out.printf("Web UI at http://%s/\n", gWeb.ip().c_str());
+    else out.println("The address is printed on the serial console once connected; see 'wifi status'.");
     return true;
   }
 

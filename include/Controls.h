@@ -1,9 +1,12 @@
 #pragma once
 //
-// Buttons, status LED and the power protection state machine.
+// Buttons, status LED, the TX request / inhibit line and the power warning
+// state machine.
 //
 
 #include <Arduino.h>
+
+#include <atomic>
 
 #include "Config.h"
 #include "Settings.h"
@@ -80,6 +83,59 @@ class DebouncedButton {
 
 // -----------------------------------------------------------------------------
 
+// The TX request line (and its inverted twin) is driven from two cores: the
+// main loop asserts it around a tune, and the sensor task asserts it the
+// moment it sees an overload. A safety latch must never be released by the
+// tune logic finishing, so the two sources are kept separate and OR-ed.
+class TxLine {
+ public:
+  void begin(Settings* settings) {
+    cfg_ = settings;
+    write(false);
+    if (kPins.txReq >= 0) pinMode(kPins.txReq, OUTPUT);
+    if (kPins.txReqInv >= 0) pinMode(kPins.txReqInv, OUTPUT);
+    write(false);
+  }
+
+  // Tune logic. Cannot release a safety latch.
+  void request(bool active) {
+    requested_ = active;
+    write(active || latched_);
+    // The sensor task may have latched between the read above and the write.
+    if (!active && latched_) write(true);
+  }
+
+  // Safety inhibit. Safe to call from the sensor task.
+  void latch() {
+    latched_ = true;
+    write(true);
+  }
+
+  void releaseLatch() {
+    latched_ = false;
+    write(requested_);
+    // The sensor task may have latched again between the two lines above.
+    if (latched_) write(true);
+  }
+
+  bool latched() const { return latched_; }
+  bool asserted() const { return requested_ || latched_; }
+
+ private:
+  Settings* cfg_ = nullptr;
+  std::atomic<bool> requested_{false};
+  std::atomic<bool> latched_{false};
+
+  void write(bool active) const {
+    if (!cfg_) return;
+    bool level = cfg_->requestTxActiveHigh ? active : !active;
+    if (kPins.txReq >= 0) digitalWrite(kPins.txReq, level ? HIGH : LOW);
+    if (kPins.txReqInv >= 0) digitalWrite(kPins.txReqInv, level ? LOW : HIGH);
+  }
+};
+
+// -----------------------------------------------------------------------------
+
 class StatusLed {
  public:
   void begin() {
@@ -98,6 +154,8 @@ class StatusLed {
 
 // -----------------------------------------------------------------------------
 
+// Warning level and the slow (loop-rate) overload check. The fast overload
+// trip lives in the sensor task (Sensor.h).
 class PowerProtection {
  public:
   void begin(Settings* settings) { cfg_ = settings; }

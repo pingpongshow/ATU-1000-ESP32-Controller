@@ -7,10 +7,11 @@
 //      (auto-probed at 0x48..0x4F). Costs no extra GPIO, which matters because
 //      every ADC1 pin on this board is already spoken for.
 //   2. An NTC thermistor on kPins.ntcAdc, if you free up an ADC1 pin.
-//   3. The ESP32-S3 internal die sensor, as a coarse last resort.
+//   3. The ESP32-S3 internal die sensor, reported for information only.
 //
 // Escalation: warn -> foldback (inhibit TX and refuse to tune) -> limit
-// (engage bypass).
+// (engage bypass). The die sensor never escalates: it measures the chip, which
+// runs warm on its own with Wi-Fi up, not the relays or the inductors.
 //
 
 #include <Arduino.h>
@@ -71,6 +72,11 @@ class Thermal {
     tempC_ = valid_ ? (tempC_ * 0.7f + t * 0.3f) : t;
     valid_ = true;
 
+    if (source_ == TempSource::Internal) {
+      level_ = ThermalLevel::Ok;
+      return;
+    }
+
     // Hysteresis of 3 C on the way back down, so a sensor sitting exactly on a
     // threshold does not chatter the TX inhibit line.
     const float h = 3.0f;
@@ -84,6 +90,8 @@ class Thermal {
   }
 
   bool available() const { return source_ != TempSource::None && valid_; }
+  // False for the die sensor, which is informational only.
+  bool protects() const { return source_ == TempSource::I2c || source_ == TempSource::Ntc; }
   float tempC() const { return tempC_; }
   ThermalLevel level() const { return cfg_ && cfg_->thermalEnabled ? level_ : ThermalLevel::Ok; }
   bool inhibitsTx() const { return level() >= ThermalLevel::Foldback; }

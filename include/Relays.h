@@ -2,8 +2,13 @@
 //
 // Relay bank driver.
 //
-// Adds over the original: pulsed (impulse-relay) drive mode, per-relay cycle
-// counters persisted to NVS, and an antenna selector output.
+// Adds over the original: per-relay cycle counters persisted to NVS and an
+// antenna selector output.
+//
+// There is deliberately no latching-relay mode. Each relay has a single
+// low-side driver, which can pulse a coil on but has no way to deliver the
+// reset pulse (second coil or reversed polarity) a latching relay needs to
+// turn off again, so such a mode could never release a relay.
 //
 
 #include <Arduino.h>
@@ -20,64 +25,46 @@ constexpr uint8_t kTrackedRelayCount = kRelayCount * 2 + 1;
 
 class RelayController {
  public:
-  void begin(Settings* settings) {
+  // `initial` is driven straight away, so a restored tune comes back without
+  // first dropping every relay and picking them up again.
+  void begin(Settings* settings, const RelayState& initial) {
     cfg_ = settings;
-    for (uint8_t i = 0; i < kRelayCount; ++i) {
-      setupOutput(kPins.lRelays[i]);
-      setupOutput(kPins.cRelays[i]);
-    }
-    setupOutput(kPins.topologyRelay);
+    applied_ = initial;
 
     prefs_.begin("atu_cycles", false);
     size_t got = prefs_.getBytes("cycles", cycles_, sizeof(cycles_));
     if (got != sizeof(cycles_)) memset(cycles_, 0, sizeof(cycles_));
 
-    for (uint8_t i = 0; i < kAntennaPinCount; ++i) setupOutput(kPins.antenna[i]);
-
-    applied_ = RelayState{};
-    driven_ = RelayState{};
-    writeAll(applied_, /*force=*/true);
+    // Set the output latch before enabling the driver so the line never
+    // glitches to the wrong level.
+    writeAll(applied_);
+    for (uint8_t i = 0; i < kRelayCount; ++i) {
+      enableOutput(kPins.lRelays[i]);
+      enableOutput(kPins.cRelays[i]);
+    }
+    enableOutput(kPins.topologyRelay);
+    for (uint8_t i = 0; i < kAntennaPinCount; ++i) {
+      if (kPins.antenna[i] >= 0) digitalWrite(kPins.antenna[i], LOW);
+      enableOutput(kPins.antenna[i]);
+    }
+    settleStartMs_ = millis();
   }
 
-  // Requested state. In pulsed mode the physical lines are released again by
-  // loop() once latchPulseMs has expired.
   void apply(const RelayState& state) {
-    RelayState next = state;
-    if (next != applied_) {
-      countTransitions(applied_, next);
-      applied_ = next;
-      writeAll(next, /*force=*/false);
-      pulseStartMs_ = millis();
-      pulseActive_ = (mode() == RelayMode::Pulsed);
-      settleStartMs_ = millis();
-    }
+    if (state == applied_) return;
+    countTransitions(applied_, state);
+    applied_ = state;
+    writeAll(state);
+    settleStartMs_ = millis();
   }
 
   void loop() {
-    if (pulseActive_ && elapsed(pulseStartMs_) >= cfg_->latchPulseMs) {
-      pulseActive_ = false;
-      // Release every coil; a latching relay holds its last commanded position.
-      for (uint8_t i = 0; i < kRelayCount; ++i) {
-        writeRelay(kPins.lRelays[i], false);
-        writeRelay(kPins.cRelays[i], false);
-      }
-      writeRelay(kPins.topologyRelay, false);
-    }
     if (cyclesDirty_ && elapsed(cyclesDirtyMs_) > 30000) saveCycles();
   }
 
   // True once the relays have had time to physically settle after the last
-  // change. Callers poll this instead of blocking on delay(). In pulsed mode
-  // the coil drive itself outlasts the nominal settle time, so wait for the
-  // pulse to finish as well or measurements land mid-transition.
-  uint32_t settleMs() const {
-    uint32_t s = cfg_->relaySettleMs;
-    if (mode() == RelayMode::Pulsed) {
-      uint32_t p = static_cast<uint32_t>(cfg_->latchPulseMs) + 5U;
-      if (p > s) s = p;
-    }
-    return s;
-  }
+  // change. Callers poll this instead of blocking on delay().
+  uint32_t settleMs() const { return cfg_->relaySettleMs; }
   bool settled() const { return elapsed(settleStartMs_) >= settleMs(); }
   uint32_t settleRemainingMs() const {
     uint32_t e = elapsed(settleStartMs_);
@@ -142,21 +129,14 @@ class RelayController {
   Settings* cfg_ = nullptr;
   Preferences prefs_;
   RelayState applied_{};
-  RelayState driven_{};
   uint32_t cycles_[kTrackedRelayCount]{};
   bool cyclesDirty_ = false;
   uint32_t cyclesDirtyMs_ = 0;
-  bool pulseActive_ = false;
-  uint32_t pulseStartMs_ = 0;
   uint32_t settleStartMs_ = 0;
   uint8_t antenna_ = 0;
 
-  RelayMode mode() const { return static_cast<RelayMode>(cfg_->relayMode); }
-
-  void setupOutput(int pin) const {
-    if (pin < 0) return;
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, cfg_ && !cfg_->relayActiveHigh ? HIGH : LOW);
+  static void enableOutput(int pin) {
+    if (pin >= 0) pinMode(pin, OUTPUT);
   }
 
   void writeRelay(int pin, bool on) const {
@@ -165,8 +145,7 @@ class RelayController {
     digitalWrite(pin, level ? HIGH : LOW);
   }
 
-  void writeAll(const RelayState& state, bool force) {
-    (void)force;
+  void writeAll(const RelayState& state) {
     uint8_t lMask = state.bypass ? 0 : state.lMask;
     uint8_t cMask = state.bypass ? 0 : state.cMask;
     for (uint8_t i = 0; i < kRelayCount; ++i) {
@@ -174,7 +153,6 @@ class RelayController {
       writeRelay(kPins.cRelays[i], (cMask >> i) & 0x01);
     }
     writeRelay(kPins.topologyRelay, state.topology);
-    driven_ = state;
   }
 
   void countTransitions(const RelayState& from, const RelayState& to) {

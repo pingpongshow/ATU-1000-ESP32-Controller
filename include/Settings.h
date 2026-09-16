@@ -18,9 +18,118 @@
 
 namespace atu {
 
-constexpr uint8_t kSettingsVersion = 2;
+constexpr uint8_t kSettingsVersion = 3;
 
 struct Settings {
+  uint8_t version;
+
+  // --- Serial / CAT ---
+  uint32_t catBaud;
+  uint32_t catTimeoutMs;
+  uint8_t catProtocol;        // CatProtocol
+  bool catEnabled;
+  uint32_t catPollMs;         // 0 = never poll, only listen
+  bool catUsbPassthrough;     // share the radio's CAT port with a PC over USB
+  uint8_t icomAddress;        // Icom radio CI-V address, 0 = learn from traffic
+  bool catTuneEnabled;        // TUNE button keys the radio over CAT
+  uint8_t catTunePowerW;
+  uint8_t catTuneMode;        // CarrierMode
+  uint32_t catTuneMaxMs;      // hard key-down limit for a CAT tune
+
+  // --- Timing ---
+  uint32_t sensorUpdateMs;
+  uint32_t displayUpdateMs;
+  uint32_t relaySettleMs;
+  uint32_t retuneHoldoffMs;
+  uint32_t txRequestLeadMs;
+  uint32_t txRequestTrailMs;
+
+  // --- Power thresholds (W) ---
+  float minTunePowerW;
+  float minAutoRetunePowerW;
+  float maxTunePowerW;        // also the most the relays are ever switched under
+  float powerLimitW;
+  float powerWarningW;
+  uint32_t powerOverloadHoldoffMs;
+  bool powerProtEnabled;
+  uint32_t protectWaitMs;     // how long to wait for RF to drop before holding
+
+  // --- SWR thresholds ---
+  float targetSWR;
+  float goodSWR;
+  float autoRetuneSWR;
+  float maxSWR;
+
+  // --- Tuning algorithm ---
+  uint8_t measureSamples;     // FWD/REV pairs per quick measurement
+  uint8_t preciseSamples;     // pairs per precise measurement near the match
+  uint8_t refinePasses;
+  uint16_t maxTuneSteps;      // hard ceiling on measurements per tune
+  bool tuneModelFit;
+
+  // --- Frequency memory ---
+  uint32_t memoryBinHz;
+  uint16_t maxMemoryEntries;
+  bool memoryBandFallback;
+  uint32_t memoryInterpHz;    // 0 = no interpolation
+
+  // --- Display ---
+  uint8_t displayType;        // DisplayKind
+  uint8_t lcdAddress;
+  uint8_t lcdCols;
+  uint8_t lcdRows;
+  uint8_t oledAddress;
+  uint8_t oledDriver;         // 0 = SSD1309 NONAME2, 1 = SSD1306 NONAME, 2 = SSD1309 NONAME0
+  uint8_t oledContrast;
+  uint16_t dimAfterSec;       // 0 = never dim
+  uint16_t blankAfterSec;     // 0 = never blank
+  uint16_t burnInShiftSec;    // 0 = no pixel shift
+
+  // --- Hardware ---
+  bool relayActiveHigh;
+  bool requestTxActiveHigh;
+  bool buttonsActiveLow;
+
+  // --- Feature enables ---
+  bool autoTune;
+  bool autoTuneUnknownCatFrequency;
+  bool bypassOnBoot;
+
+  // --- SWR bridge calibration ---
+  float fwdOffsetMv;
+  float revOffsetMv;
+  float fwdScale;
+  float revScale;
+  float powerScale;
+  float swrMinForward;
+
+  // --- Thermal ---
+  bool thermalEnabled;
+  uint8_t tempAddress;        // 0 = auto-probe LM75/TMP102 family
+  float tempWarnC;
+  float tempFoldbackC;
+  float tempLimitC;
+  float ntcBeta;
+  float ntcNominalOhms;
+  float ntcSeriesOhms;
+
+  // --- Antenna selector ---
+  uint8_t antenna;            // currently selected antenna index
+  uint8_t antennaCount;
+
+  // --- Wi-Fi / web UI ---
+  bool wifiEnabled;
+  bool wifiApFallback;
+  char wifiSsid[33];
+  char wifiPass[65];
+  char hostname[25];
+
+  uint32_t checksum;
+};
+
+// Layout of the v2.0 settings blob, kept only so an upgrade does not throw
+// away a calibrated tuner's configuration.
+struct SettingsV2 {
   uint8_t version;
 
   // --- Serial / CAT ---
@@ -127,6 +236,13 @@ inline void settingsDefaults(Settings& s) {
   s.catTimeoutMs = 5000;
   s.catProtocol = static_cast<uint8_t>(CatProtocol::Auto);
   s.catEnabled = true;
+  s.catPollMs = 1000;
+  s.catUsbPassthrough = false;
+  s.icomAddress = 0;
+  s.catTuneEnabled = false;
+  s.catTunePowerW = 10;
+  s.catTuneMode = static_cast<uint8_t>(CarrierMode::Fm);
+  s.catTuneMaxMs = 15000;
 
   s.sensorUpdateMs = 100;
   s.displayUpdateMs = 200;
@@ -142,20 +258,23 @@ inline void settingsDefaults(Settings& s) {
   s.powerWarningW = 800.0f;
   s.powerOverloadHoldoffMs = 5000;
   s.powerProtEnabled = true;
+  s.protectWaitMs = 300;
 
   s.targetSWR = 1.2f;
   s.goodSWR = 1.5f;
   s.autoRetuneSWR = 2.5f;
   s.maxSWR = 10.0f;
 
-  s.measureSamples = 4;
-  s.measureSampleSpacingMs = 3;
+  s.measureSamples = 8;
+  s.preciseSamples = 24;
   s.refinePasses = 3;
   s.maxTuneSteps = 160;
+  s.tuneModelFit = true;
 
   s.memoryBinHz = 25000;
   s.maxMemoryEntries = 256;
   s.memoryBandFallback = true;
+  s.memoryInterpHz = 300000;
 
   s.displayType = static_cast<uint8_t>(DisplayKind::Auto);
   s.lcdAddress = 0x27;
@@ -171,8 +290,6 @@ inline void settingsDefaults(Settings& s) {
   s.relayActiveHigh = true;
   s.requestTxActiveHigh = true;
   s.buttonsActiveLow = true;
-  s.relayMode = static_cast<uint8_t>(RelayMode::Continuous);
-  s.latchPulseMs = 30;
 
   s.autoTune = true;
   s.autoTuneUnknownCatFrequency = true;
@@ -202,6 +319,44 @@ inline void settingsDefaults(Settings& s) {
   s.wifiSsid[0] = '\0';
   s.wifiPass[0] = '\0';
   strncpy(s.hostname, "atu1000", sizeof(s.hostname) - 1);
+}
+
+
+// The loader tells the two layouts apart by blob size.
+static_assert(sizeof(Settings) != sizeof(SettingsV2), "settings layouts must differ in size");
+
+// Carries every setting that still exists across from a v2.0 blob.
+inline void migrateFromV2(const SettingsV2& o, Settings& s) {
+  settingsDefaults(s);
+#define ATU_COPY(f) s.f = o.f
+  ATU_COPY(catBaud); ATU_COPY(catTimeoutMs); ATU_COPY(catProtocol); ATU_COPY(catEnabled);
+  ATU_COPY(sensorUpdateMs); ATU_COPY(displayUpdateMs); ATU_COPY(relaySettleMs);
+  ATU_COPY(retuneHoldoffMs); ATU_COPY(txRequestLeadMs); ATU_COPY(txRequestTrailMs);
+  ATU_COPY(minTunePowerW); ATU_COPY(minAutoRetunePowerW); ATU_COPY(maxTunePowerW);
+  ATU_COPY(powerLimitW); ATU_COPY(powerWarningW); ATU_COPY(powerOverloadHoldoffMs);
+  ATU_COPY(powerProtEnabled);
+  ATU_COPY(targetSWR); ATU_COPY(goodSWR); ATU_COPY(autoRetuneSWR); ATU_COPY(maxSWR);
+  ATU_COPY(refinePasses); ATU_COPY(maxTuneSteps);
+  ATU_COPY(memoryBinHz); ATU_COPY(maxMemoryEntries); ATU_COPY(memoryBandFallback);
+  ATU_COPY(displayType); ATU_COPY(lcdAddress); ATU_COPY(lcdCols); ATU_COPY(lcdRows);
+  ATU_COPY(oledAddress); ATU_COPY(oledDriver); ATU_COPY(oledContrast);
+  ATU_COPY(dimAfterSec); ATU_COPY(blankAfterSec); ATU_COPY(burnInShiftSec);
+  ATU_COPY(relayActiveHigh); ATU_COPY(requestTxActiveHigh); ATU_COPY(buttonsActiveLow);
+  ATU_COPY(autoTune); ATU_COPY(autoTuneUnknownCatFrequency); ATU_COPY(bypassOnBoot);
+  ATU_COPY(fwdOffsetMv); ATU_COPY(revOffsetMv); ATU_COPY(fwdScale); ATU_COPY(revScale);
+  ATU_COPY(powerScale); ATU_COPY(swrMinForward);
+  ATU_COPY(thermalEnabled); ATU_COPY(tempAddress); ATU_COPY(tempWarnC);
+  ATU_COPY(tempFoldbackC); ATU_COPY(tempLimitC); ATU_COPY(ntcBeta);
+  ATU_COPY(ntcNominalOhms); ATU_COPY(ntcSeriesOhms);
+  ATU_COPY(antenna); ATU_COPY(antennaCount);
+  ATU_COPY(wifiEnabled); ATU_COPY(wifiApFallback);
+#undef ATU_COPY
+  memcpy(s.wifiSsid, o.wifiSsid, sizeof(s.wifiSsid));
+  memcpy(s.wifiPass, o.wifiPass, sizeof(s.wifiPass));
+  memcpy(s.hostname, o.hostname, sizeof(s.hostname));
+  // v2 sampled with 3 ms spacing; the sampling task now takes one pair per
+  // millisecond, so the old default of 4 samples would be noisier than before.
+  if (o.measureSamples > s.measureSamples) s.measureSamples = o.measureSamples;
 }
 
 // -----------------------------------------------------------------------------
@@ -237,16 +392,17 @@ constexpr SettingDef kSettingDefs[] = {
     {"swrtarget",  SettingType::F32,  ATU_SET(targetSWR), 0, 1.0f, 5.0f, "Target SWR (tune success)"},
     {"swrgood",    SettingType::F32,  ATU_SET(goodSWR), 0, 1.0f, 5.0f, "Acceptable SWR"},
     {"swrretune",  SettingType::F32,  ATU_SET(autoRetuneSWR), 0, 1.0f, 20.0f, "Auto-retune SWR threshold"},
-    {"swrmax",     SettingType::F32,  ATU_SET(maxSWR), 0, 1.0f, 99.0f, "SWR alarm threshold"},
+    {"swrmax",     SettingType::F32,  ATU_SET(maxSWR), 0, 1.1f, 99.0f, "High-SWR alarm threshold"},
 
     // Power
     {"pwrmin",     SettingType::F32,  ATU_SET(minTunePowerW), 0, 0, 500, "Min power to tune (W)"},
-    {"pwrmax",     SettingType::F32,  ATU_SET(maxTunePowerW), 0, 1, 500, "Max power to tune (W)"},
+    {"pwrmax",     SettingType::F32,  ATU_SET(maxTunePowerW), 0, 1, 500, "Max power to tune or switch relays (W)"},
     {"pwrautomin", SettingType::F32,  ATU_SET(minAutoRetunePowerW), 0, 0, 500, "Min power for auto-retune (W)"},
     {"pwrlimit",   SettingType::F32,  ATU_SET(powerLimitW), 0, 10, kAbsMaxPowerLimitW, "Overload limit (W)"},
     {"pwrwarn",    SettingType::F32,  ATU_SET(powerWarningW), 0, 10, kAbsMaxPowerLimitW, "Warning threshold (W)"},
     {"pwrholdoff", SettingType::U32,  ATU_SET(powerOverloadHoldoffMs), 0, 100, 60000, "Overload cooldown (ms)"},
     {"pwrprot",    SettingType::Bool, ATU_SET(powerProtEnabled), 0, 0, 1, "Power protection on/off"},
+    {"protwait",   SettingType::U32,  ATU_SET(protectWaitMs), 0, 50, 5000, "Wait for RF to drop before holding (ms)"},
 
     // Timing
     {"settle",     SettingType::U32,  ATU_SET(relaySettleMs), 0, 1, 500, "Relay settle time (ms)"},
@@ -257,21 +413,30 @@ constexpr SettingDef kSettingDefs[] = {
     {"dispms",     SettingType::U32,  ATU_SET(displayUpdateMs), 0, 20, 5000, "Display update period (ms)"},
 
     // Tuning
-    {"samples",    SettingType::U8,   ATU_SET(measureSamples), 0, 1, 64, "ADC samples per measurement"},
-    {"spacing",    SettingType::U16,  ATU_SET(measureSampleSpacingMs), 0, 0, 100, "Sample spacing (ms)"},
-    {"refine",     SettingType::U8,   ATU_SET(refinePasses), 0, 0, 10, "Local refinement passes"},
+    {"samples",    SettingType::U8,   ATU_SET(measureSamples), 0, 1, 64, "FWD/REV pairs per quick measurement"},
+    {"psamples",   SettingType::U8,   ATU_SET(preciseSamples), 0, 1, 64, "FWD/REV pairs per precise measurement"},
+    {"refine",     SettingType::U8,   ATU_SET(refinePasses), 0, 0, 10, "Search re-expansions after converging"},
     {"maxsteps",   SettingType::U16,  ATU_SET(maxTuneSteps), 0, 10, 2000, "Max measurements per tune"},
+    {"tunemodel",  SettingType::Bool, ATU_SET(tuneModelFit), 0, 0, 1, "Fit a load model during tune"},
 
     // Memory
     {"membin",     SettingType::U32,  ATU_SET(memoryBinHz), 0, 1000, 1000000, "Memory bin width (Hz)"},
     {"memmax",     SettingType::U16,  ATU_SET(maxMemoryEntries), 0, 8, 1024, "Max memory entries"},
     {"memband",    SettingType::Bool, ATU_SET(memoryBandFallback), 0, 0, 1, "Per-band memory fallback"},
+    {"meminterp",  SettingType::U32,  ATU_SET(memoryInterpHz), 0, 0, 2000000, "Blend memories this far apart (Hz, 0=off)"},
 
     // CAT
     {"catbaud",    SettingType::U32,  ATU_SET(catBaud), 0, 300, 115200, "CAT baud rate"},
     {"cattimeout", SettingType::U32,  ATU_SET(catTimeoutMs), 0, 500, 120000, "CAT link timeout (ms)"},
-    {"catproto",   SettingType::U8,   ATU_SET(catProtocol), 0, 0, 5, "0=auto 1=kenwood 2=icom 3=yaesu 4=yaesuN 5=off"},
+    {"catproto",   SettingType::U8,   ATU_SET(catProtocol), 0, 0, 6, "0=auto 1=kenwood 2=icom 3=yaesu 4=yaesuN 5=off 6=flex"},
     {"caten",      SettingType::Bool, ATU_SET(catEnabled), 0, 0, 1, "CAT enabled"},
+    {"catpoll",    SettingType::U32,  ATU_SET(catPollMs), 0, 0, 60000, "Poll radio frequency (ms, 0=listen only)"},
+    {"catusb",     SettingType::Bool, ATU_SET(catUsbPassthrough), 0, 0, 1, "Pass CAT through to the native USB port"},
+    {"civaddr",    SettingType::U8,   ATU_SET(icomAddress), 0, 0, 255, "Icom CI-V radio address (0=learn)"},
+    {"cattune",    SettingType::Bool, ATU_SET(catTuneEnabled), 0, 0, 1, "TUNE button keys the radio over CAT"},
+    {"catpwr",     SettingType::U8,   ATU_SET(catTunePowerW), 0, 1, 100, "CAT tune carrier power (W)"},
+    {"catmode",    SettingType::U8,   ATU_SET(catTuneMode), 0, 0, 2, "CAT tune carrier 0=FM 1=AM 2=CW"},
+    {"catmaxms",   SettingType::U32,  ATU_SET(catTuneMaxMs), 0, 2000, 60000, "CAT tune key-down limit (ms)"},
 
     // Display
     {"disptype",   SettingType::U8,   ATU_SET(displayType), 0, 0, 3, "0=auto 1=none 2=lcd 3=oled"},
@@ -289,8 +454,6 @@ constexpr SettingDef kSettingDefs[] = {
     {"relayhigh",  SettingType::Bool, ATU_SET(relayActiveHigh), 0, 0, 1, "Relay drive active high"},
     {"txhigh",     SettingType::Bool, ATU_SET(requestTxActiveHigh), 0, 0, 1, "TX request active high"},
     {"btnlow",     SettingType::Bool, ATU_SET(buttonsActiveLow), 0, 0, 1, "Buttons active low"},
-    {"relaymode",  SettingType::U8,   ATU_SET(relayMode), 0, 0, 1, "0=continuous 1=pulsed/latching"},
-    {"latchms",    SettingType::U16,  ATU_SET(latchPulseMs), 0, 1, 500, "Latching coil pulse (ms)"},
 
     // Features
     {"autotune",   SettingType::Bool, ATU_SET(autoTune), 0, 0, 1, "Auto-tune enabled"},
@@ -332,19 +495,33 @@ class SettingsStore {
   void begin() {
     prefs_.begin("atu_cfg", false);
     settingsDefaults(s_);
-    Settings loaded;
-    size_t got = prefs_.getBytes("cfg", &loaded, sizeof(loaded));
-    if (got == sizeof(loaded) && loaded.version == kSettingsVersion &&
-        checksumOf(loaded) == loaded.checksum) {
-      s_ = loaded;
-      loadedOk_ = true;
+    size_t len = prefs_.getBytesLength("cfg");
+    if (len == sizeof(Settings)) {
+      Settings loaded;
+      prefs_.getBytes("cfg", &loaded, sizeof(loaded));
+      if (loaded.version == kSettingsVersion && checksumOf(loaded) == loaded.checksum) {
+        s_ = loaded;
+        loadedOk_ = true;
+      }
+    } else if (len == sizeof(SettingsV2)) {
+      SettingsV2 old;
+      prefs_.getBytes("cfg", &old, sizeof(old));
+      uint32_t crc = crc32(reinterpret_cast<const uint8_t*>(&old),
+                           sizeof(SettingsV2) - sizeof(old.checksum));
+      if (old.version == 2 && crc == old.checksum) {
+        migrateFromV2(old, s_);
+        loadedOk_ = true;
+        migrated_ = true;
+      }
     }
     clampAll();
+    if (migrated_) save();
   }
 
   Settings& get() { return s_; }
   const Settings& get() const { return s_; }
   bool loadedFromNvs() const { return loadedOk_; }
+  bool migrated() const { return migrated_; }
 
   void save() {
     clampAll();
@@ -466,6 +643,7 @@ class SettingsStore {
   Settings s_{};
   bool dirty_ = false;
   bool loadedOk_ = false;
+  bool migrated_ = false;
   uint32_t dirtyMs_ = 0;
 
   static uint32_t checksumOf(const Settings& s) {
@@ -532,6 +710,8 @@ class SettingsStore {
     if (s_.goodSWR < s_.targetSWR) s_.goodSWR = s_.targetSWR;
     if (s_.autoRetuneSWR < s_.goodSWR) s_.autoRetuneSWR = s_.goodSWR;
     if (s_.maxTunePowerW < s_.minTunePowerW) s_.maxTunePowerW = s_.minTunePowerW;
+    if (s_.preciseSamples < s_.measureSamples) s_.preciseSamples = s_.measureSamples;
+    if (s_.catProtocol > static_cast<uint8_t>(CatProtocol::Flex)) s_.catProtocol = 0;
     if (s_.tempFoldbackC > s_.tempLimitC) s_.tempFoldbackC = s_.tempLimitC;
     if (s_.tempWarnC > s_.tempFoldbackC) s_.tempWarnC = s_.tempFoldbackC;
     if (s_.antenna >= s_.antennaCount) s_.antenna = 0;

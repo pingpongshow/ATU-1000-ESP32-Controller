@@ -162,6 +162,13 @@ inline float gammaOf(Cplx zin) {
   return m > 1.0f ? 1.0f : m;
 }
 
+// Hot-loop variant with the relay values already looked up.
+inline float modelGammaLC(float freqHz, float lUh, float cPf, bool topology,
+                          bool invertedMapping, Cplx zLoad) {
+  return gammaOf(networkInputZ(freqHz, lUh, cPf, capsAtLoadFor(topology, invertedMapping),
+                               zLoad, Parasitics()));
+}
+
 inline float modelGamma(uint32_t freqHz, const RelayState& s, bool invertedMapping,
                         Cplx zLoad, const Parasitics& p = Parasitics()) {
   float lUh = s.bypass ? 0.0f : maskToUh(s.lMask);

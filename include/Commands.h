@@ -9,8 +9,12 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+#include <algorithm>
+#include <cmath>
+
 #include "App.h"
 #include "Config.h"
+#include "Network.h"
 #include "Solver.h"
 #include "Types.h"
 
@@ -54,11 +58,20 @@ inline void printStatus(Print& out) {
              static_cast<unsigned>(a.relays.totalC()),
              a.state.topology ? "Hi-Z" : "Lo-Z",
              a.state.bypass ? "  BYPASS" : "");
+  if (a.relayPending) {
+    out.printf("Pending : L=0x%02X C=0x%02X %s%s - held until RF <= %.0f W\n",
+               a.pendingState.lMask, a.pendingState.cMask,
+               a.pendingState.topology ? "Hi-Z" : "Lo-Z",
+               a.pendingState.bypass ? " BYPASS" : "", c.maxTunePowerW);
+  }
   out.printf("Mode    : %s   Status: %s\n", c.autoTune ? "AUTO" : "MANUAL",
              a.status.c_str());
-  out.printf("CAT     : %s @ %lu baud %s\n", a.cat.protocolName(),
+  out.printf("CAT     : %s @ %lu baud, poll %lu ms%s%s%s\n", a.cat.protocolName(),
              static_cast<unsigned long>(c.catBaud),
-             a.cat.enabled() ? "" : "(disabled)");
+             static_cast<unsigned long>(c.catPollMs),
+             a.cat.enabled() ? "" : " (disabled)",
+             a.cat.usbPassthrough() ? (a.cat.pcActive() ? ", USB PC active" : ", USB passthrough") : "",
+             c.catTuneEnabled ? ", CAT tune on" : "");
   out.printf("Memory  : %u entries\n", static_cast<unsigned>(a.memory.size()));
   out.printf("Display : %s\n", a.display.kindName());
   if (a.thermal.available()) {
@@ -71,8 +84,11 @@ inline void printStatus(Print& out) {
   out.printf("Protect : limit %.0f W, warn %.0f W, %s\n", c.powerLimitW,
              c.powerWarningW, c.powerProtEnabled ? "enabled" : "DISABLED");
   if (a.powerProt.overload() || a.protectionLatched) {
-    out.printf("*** PROTECTION ACTIVE: %s ***\n", a.protectionReason);
+    out.printf("*** PROTECTION ACTIVE: %s (%s) ***\n", a.protectionReason,
+               a.protectState == ProtectState::WaitRfDrop ? "TX inhibit, waiting for RF to drop"
+                                                          : "TX inhibit, bypass engaged");
   }
+  if (a.swrAlarm) out.printf("*** HIGH SWR ALARM (above %.1f) ***\n", c.maxSWR);
   out.printf("Relays  : %lu total operations\n",
              static_cast<unsigned long>(a.relays.totalCycles()));
   out.printf("Uptime  : %lu s   Heap: %lu\n",
@@ -85,8 +101,9 @@ inline void printHelp(Print& out) {
   out.println("  status | help | reboot");
   out.println("Tuning");
   out.println("  tune              start a tune (needs RF)");
-  out.println("  tune force        tune without the RF power check");
-  out.println("  abort             stop a tune or sweep in progress");
+  out.println("  tune force        tune without the minimum-power check");
+  out.println("  tune cat          key the radio over CAT, tune, restore");
+  out.println("  abort             stop a tune, CAT tune or sweep");
   out.println("  bypass on|off     bypass toggle");
   out.println("  auto on|off       auto-tune toggle");
   out.println("  freq <hz>         set the working frequency");
@@ -102,8 +119,11 @@ inline void printHelp(Print& out) {
   out.println("  mem del <hz>      delete one entry");
   out.println("Diagnostics");
   out.println("  raw | cal | i2cscan | temp");
+  out.println("  cal zero          zero both detector offsets (no RF)");
   out.println("  cal fwd <watts>   solve powerScale at a known power");
-  out.println("  cal rev           zero the reverse channel into a matched load");
+  out.println("  cal rev <swr>     solve revScale into a known mismatch");
+  out.println("  cal rev           check bridge balance into a 50 ohm load");
+  out.println("  settle test       measure relay settle time (needs RF)");
   out.println("  solve <ohms>      show the ideal L/C for a load at this freq");
   out.println("Protection");
   out.println("  power reset|on|off");
@@ -111,7 +131,8 @@ inline void printHelp(Print& out) {
   out.println("  sweep <startMHz> <endMHz> [stepkHz] [dwellMs]");
   out.println("  sweep stop");
   out.println("CAT");
-  out.println("  cat auto|kenwood|icom|yaesu|yaesun|off");
+  out.println("  cat auto|kenwood|icom|yaesu|yaesun|flex|off");
+  out.println("  (see catpoll, catusb, civaddr, cattune, catpwr, catmode)");
   out.println("Configuration");
   out.println("  config            list every setting");
   out.println("  get <key>");
@@ -137,6 +158,8 @@ inline void printConfig(Print& out, const char* filter) {
 
 inline bool cmdMem(const char* args, Print& out);
 inline bool cmdCal(const char* args, Print& out);
+inline bool cmdSettleTest(Print& out);
+inline bool measurementBusy(Print& out);
 inline bool cmdSweep(const char* args, Print& out);
 inline bool cmdWifi(const char* args, Print& out);
 
@@ -188,25 +211,39 @@ inline void handleCommand(const char* line, Print& out) {
     return;
   }
   if (!strcasecmp(line, "tune force")) {
-    if (!beginTune(true)) out.println("Busy or inhibited");
+    if (!beginTune(true)) out.printf("Not started: %s\n", a.status.c_str());
     else out.println("Force tuning...");
     return;
   }
+  if (!strcasecmp(line, "tune cat")) {
+    if (a.catTune.start()) {
+      out.printf("CAT tune: keying the radio at %u W %s, limit %lu ms\n", c.catTunePowerW,
+                 c.catTuneMode == 1 ? "AM" : c.catTuneMode == 2 ? "CW" : "FM",
+                 static_cast<unsigned long>(c.catTuneMaxMs));
+    } else {
+      out.printf("Not started: %s\n", a.status.c_str());
+    }
+    return;
+  }
   if (!strcasecmp(line, "abort") || !strcasecmp(line, "stop")) {
-    bool did = false;
-    if (a.tuner.running()) { a.tuner.abort(); did = true; }
-    if (a.sweep.isRunning()) { a.sweep.stop(); did = true; }
+    bool did = a.tuner.running() || a.sweep.isRunning() || a.catTune.active();
+    abortActivity(did ? "ABORTED" : nullptr);
     out.println(did ? "Aborting" : "Nothing running");
     return;
   }
 
   if (!strncasecmp(line, "bypass ", 7)) {
     const char* v = line + 7;
-    if (!strcasecmp(v, "on")) { a.state.bypass = true; a.status.set("BYPASS"); }
-    else if (!strcasecmp(v, "off")) { a.state.bypass = false; a.status.set("ACTIVE"); }
+    RelayState s = desiredRelayState();
+    if (!strcasecmp(v, "on")) s.bypass = true;
+    else if (!strcasecmp(v, "off")) s.bypass = false;
     else { out.println("Usage: bypass on|off"); return; }
-    applyRelayState(a.state);
-    saveRuntimeState();
+    if (applyRelayState(s)) {
+      a.status.set(s.bypass ? "BYPASS" : "ACTIVE");
+      saveRuntimeState();
+    } else {
+      out.printf("RF is above %.0f W; the change will apply when it drops.\n", c.maxTunePowerW);
+    }
     printStatus(out);
     return;
   }
@@ -232,9 +269,8 @@ inline void handleCommand(const char* line, Print& out) {
     a.memTriedBin = UINT32_MAX;
     MemLookup m = a.memory.lookup(hz, c.antenna);
     if (m.hit != MemHit::Miss) {
-      applyRelayState(m.state);
+      if (applyRelayState(m.state)) a.status.set(memHitName(m.hit));
       a.memory.noteUse(m.bin, c.antenna);
-      a.status.set(m.hit == MemHit::Band ? "MEM BAND" : "MEM HIT");
     } else {
       a.status.set("MEM MISS");
     }
@@ -248,9 +284,13 @@ inline void handleCommand(const char* line, Print& out) {
     char* end = nullptr;
     unsigned long v = strtoul(line + 2, &end, 16);
     if (end == line + 2) { out.println("Usage: l|c <hex mask 00-7F>"); return; }
-    if (isL) a.state.lMask = static_cast<uint8_t>(v) & 0x7F;
-    else a.state.cMask = static_cast<uint8_t>(v) & 0x7F;
-    applyRelayState(a.state);
+    RelayState s = desiredRelayState();
+    if (isL) s.lMask = static_cast<uint8_t>(v) & 0x7F;
+    else s.cMask = static_cast<uint8_t>(v) & 0x7F;
+    if (!applyRelayState(s)) {
+      out.printf("RF is above %.0f W; the change will apply when it drops.\n", c.maxTunePowerW);
+      return;
+    }
     saveRuntimeState();
     out.printf("L=0x%02X (%.2f uH)  C=0x%02X (%u pF)\n", a.state.lMask,
                a.relays.totalL(), a.state.cMask,
@@ -260,10 +300,14 @@ inline void handleCommand(const char* line, Print& out) {
 
   if (!strncasecmp(line, "topo ", 5)) {
     const char* v = line + 5;
-    if (!strcasecmp(v, "hi")) a.state.topology = true;
-    else if (!strcasecmp(v, "lo")) a.state.topology = false;
+    RelayState s = desiredRelayState();
+    if (!strcasecmp(v, "hi")) s.topology = true;
+    else if (!strcasecmp(v, "lo")) s.topology = false;
     else { out.println("Usage: topo hi|lo"); return; }
-    applyRelayState(a.state);
+    if (!applyRelayState(s)) {
+      out.printf("RF is above %.0f W; the change will apply when it drops.\n", c.maxTunePowerW);
+      return;
+    }
     saveRuntimeState();
     out.printf("Topology: %s\n", a.state.topology ? "Hi-Z" : "Lo-Z");
     return;
@@ -308,11 +352,21 @@ inline void handleCommand(const char* line, Print& out) {
 
   // ---- Diagnostics ----
   if (!strcasecmp(line, "raw")) {
-    SensorReading r = a.sensor.readAverage(16, 2);
+    if (measurementBusy(out)) return;
+    SensorReading r = a.sensor.measureBlocking(32);
     out.printf("FWD: %6.0f raw  %7.1f mV\n", r.fwdRaw, r.fwdMv);
     out.printf("REV: %6.0f raw  %7.1f mV\n", r.revRaw, r.revMv);
-    if (r.valid) out.printf("SWR: %.2f   Power: %.1f W\n", r.swr, r.powerW);
-    else out.println("SWR: --     Power: 0.0 W  (below swrminfwd)");
+    if (r.valid) {
+      out.printf("SWR: %.2f   |Gamma| %.3f +/- %.3f   Power: %.1f W   (%u pairs)\n", r.swr,
+                 r.gamma, r.gammaNoise, r.powerW, r.pairs);
+    } else {
+      out.println("SWR: --     Power: 0.0 W  (below swrminfwd)");
+    }
+    return;
+  }
+
+  if (!strcasecmp(line, "settle test") || !strcasecmp(line, "settletest")) {
+    cmdSettleTest(out);
     return;
   }
 
@@ -356,6 +410,7 @@ inline void handleCommand(const char* line, Print& out) {
     out.printf("SDA=GPIO%d SCL=GPIO%d\n", kPins.i2cSda, kPins.i2cScl);
     uint8_t found = 0;
     for (uint8_t addr = 1; addr < 127; ++addr) {
+      feedLoopWDT();   // a stuck bus can make each probe time out
       Wire.beginTransmission(addr);
       if (Wire.endTransmission() == 0) {
         const char* guess = "";
@@ -415,7 +470,9 @@ inline void handleCommand(const char* line, Print& out) {
       c.catEnabled = true;
       if (!a.cat.enabled()) a.cat.begin(&c);
       a.cat.setProtocol(p);
-      out.printf("CAT protocol: %s\n", catProtocolName(p));
+      out.printf("CAT protocol: %s", catProtocolName(p));
+      if (c.catPollMs) out.printf(", polling every %lu ms", static_cast<unsigned long>(c.catPollMs));
+      out.println();
     }
     a.settingsStore.markDirty();
     return;
@@ -473,8 +530,14 @@ inline void handleCommand(const char* line, Print& out) {
     out.printf("%s = %s\n", d->key, val);
 
     // A few keys need something re-initialised to take effect now.
-    if (!strcasecmp(d->key, "catbaud") || !strcasecmp(d->key, "caten")) a.cat.restart();
-    else if (!strcasecmp(d->key, "catproto")) a.cat.setProtocol(static_cast<CatProtocol>(c.catProtocol));
+    if (!strcasecmp(d->key, "catbaud") || !strcasecmp(d->key, "caten") ||
+        !strcasecmp(d->key, "civaddr")) {
+      a.cat.restart();
+    } else if (!strcasecmp(d->key, "catusb")) {
+      out.println(c.catUsbPassthrough ? "Reboot to start the USB CAT port."
+                                      : "USB passthrough stops now; reboot to release the port.");
+    }
+    if (!strcasecmp(d->key, "catproto")) a.cat.setProtocol(static_cast<CatProtocol>(c.catProtocol));
     else if (!strcasecmp(d->key, "ant")) selectAntenna(c.antenna);
     else if (!strcasecmp(d->key, "disptype") || !strcasecmp(d->key, "lcdaddr") ||
              !strcasecmp(d->key, "lcdcols") || !strcasecmp(d->key, "lcdrows") ||
@@ -543,10 +606,21 @@ inline bool cmdMem(const char* args, Print& out) {
   return true;
 }
 
+// The tuner and the sweep own the sensor's measurement requests while they run.
+inline bool measurementBusy(Print& out) {
+  if (gApp.tuner.running() || gApp.sweep.isRunning()) {
+    out.println("A tune or sweep is using the sensor - 'abort' first.");
+    return true;
+  }
+  return false;
+}
+
 inline bool cmdCal(const char* args, Print& out) {
   App& a = gApp;
   Settings& c = a.cfg();
   while (*args == ' ') ++args;
+
+  if (*args && measurementBusy(out)) return true;
 
   if (!*args) {
     out.printf("FWD offset %.1f mV, scale %.4f\n", c.fwdOffsetMv, c.fwdScale);
@@ -554,14 +628,33 @@ inline bool cmdCal(const char* args, Print& out) {
     out.printf("Power scale %.6f   (P = (Vfwd/1000)^2 / powerScale)\n", c.powerScale);
     out.printf("SWR valid above %.0f mV forward\n", c.swrMinForward);
     out.printf("PIC reference constants: FWD=%u REV=%u\n", kPicCalForward, kPicCalReverse);
-    out.println("Wizard: key a carrier into a dummy load, then 'cal fwd <watts>'");
+    out.println("Wizard: 'cal zero' (no RF), 'cal fwd <W>' (dummy load),");
+    out.println("        'cal rev <swr>' (known mismatch, e.g. 100 ohm = 2.0)");
+    return true;
+  }
+
+  // The detectors' DC offset is what they read with no RF at all. It is not
+  // what the reverse port reads into a matched load: that residual is bridge
+  // imbalance and diode leakage, which scale with power, so zeroing it at one
+  // power level makes every other power level wrong.
+  if (!strcasecmp(args, "zero")) {
+    SensorReading r = a.sensor.measureBlocking(64);
+    if (r.fwdMv > 150.0f) {
+      out.printf("FWD reads %.1f mV - unkey the transmitter first.\n", r.fwdMv);
+      return true;
+    }
+    out.printf("No-RF offsets: FWD %.1f mV (was %.1f), REV %.1f mV (was %.1f)\n", r.fwdMv,
+               c.fwdOffsetMv, r.revMv, c.revOffsetMv);
+    c.fwdOffsetMv = clampf(r.fwdMv, 0.0f, 2000.0f);
+    c.revOffsetMv = clampf(r.revMv, 0.0f, 2000.0f);
+    a.settingsStore.save();
     return true;
   }
 
   if (!strncasecmp(args, "fwd ", 4)) {
     float watts = atof(args + 4);
     if (watts <= 0.0f) { out.println("Usage: cal fwd <watts>"); return true; }
-    SensorReading r = a.sensor.readAverage(32, 2);
+    SensorReading r = a.sensor.measureBlocking(64);
     float scale = 0.0f;
     if (!a.sensor.solvePowerScale(r, watts, scale)) {
       out.printf("Not enough forward voltage (%.1f mV). Key the transmitter first.\n",
@@ -572,31 +665,150 @@ inline bool cmdCal(const char* args, Print& out) {
                r.fwdMv, watts, scale, c.powerScale);
     c.powerScale = clampf(scale, 1e-6f, 1000.0f);
     a.settingsStore.save();
-    SensorReading check = a.sensor.readAverage(16, 2);
+    SensorReading check = a.sensor.measureBlocking(32);
     out.printf("Now reading %.1f W, SWR %.2f\n", check.powerW,
                check.valid ? check.swr : 0.0f);
     return true;
   }
 
-  if (!strcasecmp(args, "rev")) {
-    SensorReading r = a.sensor.readAverage(32, 2);
-    if (r.fwdMv < c.swrMinForward) {
-      out.println("Key a carrier into a 50 ohm dummy load first.");
+  if (!strncasecmp(args, "rev", 3)) {
+    const char* v = args + 3;
+    while (*v == ' ') ++v;
+    SensorReading r = a.sensor.measureBlocking(64);
+    float vf = a.sensor.forwardCorrectedMv(r.fwdMv);
+    if (vf < c.swrMinForward) {
+      out.println("Key a steady carrier first.");
       return true;
     }
-    // Into a matched load the reverse port should read zero, so whatever it
-    // does read is the detector's offset.
-    float newOffset = clampf(r.revMv, 0.0f, 2000.0f);
-    out.printf("REV reads %.1f mV into a matched load -> revoffset %.1f (was %.1f)\n",
-               r.revMv, newOffset, c.revOffsetMv);
-    c.revOffsetMv = newOffset;
+
+    if (!*v) {
+      // Check only. Into 50 ohms the reverse port should read (almost) zero;
+      // whatever is left is the bridge's directivity limit.
+      float g = a.sensor.reverseCorrectedMv(r.revMv) / vf;
+      out.printf("Into a 50 ohm load: REV %.1f mV, FWD %.1f mV -> SWR %.2f (|Gamma| %.3f)\n",
+                 r.revMv, r.fwdMv, gammaToSwr(g), g);
+      out.println(g < 0.05f ? "Bridge balance is good."
+                            : "Residual reflection: check the bridge balance trimmer.");
+      out.println("To calibrate REV scale, key into a known mismatch: 'cal rev <swr>'.");
+      return true;
+    }
+
+    float swr = atof(v);
+    if (swr < 1.5f || swr > 10.0f) {
+      out.println("Use a known mismatch between SWR 1.5 and 10, e.g. 100 ohm = 2.0");
+      return true;
+    }
+    float rawRev = std::max(0.0f, r.revMv - c.revOffsetMv);
+    if (rawRev < 5.0f) {
+      out.printf("REV reads only %.1f mV above its offset - is the mismatch connected?\n", rawRev);
+      return true;
+    }
+    float wantGamma = swrToGamma(swr);
+    float scale = (wantGamma * vf) / rawRev;
+    out.printf("SWR %.2f load: FWD %.1f mV, REV %.1f mV -> revScale %.4f (was %.4f)\n", swr,
+               r.fwdMv, r.revMv, scale, c.revScale);
+    c.revScale = clampf(scale, 0.001f, 1000.0f);
     a.settingsStore.save();
-    SensorReading check = a.sensor.readAverage(16, 2);
+    SensorReading check = a.sensor.measureBlocking(32);
     out.printf("Now reading SWR %.2f\n", check.valid ? check.swr : 0.0f);
     return true;
   }
 
-  out.println("Usage: cal | cal fwd <watts> | cal rev");
+  out.println("Usage: cal | cal zero | cal fwd <watts> | cal rev [<swr>]");
+  return true;
+}
+
+// Measures how long a relay change takes to show up fully at the detectors
+// (relay operate + bounce + the detector RC filter), in both directions, and
+// recommends a `settle` value.
+inline bool cmdSettleTest(Print& out) {
+  App& a = gApp;
+  Settings& c = a.cfg();
+  if (a.tuner.running() || a.sweep.isRunning() || a.catTune.active()) {
+    out.println("Busy - 'abort' first.");
+    return true;
+  }
+  if (a.protectionLatched) {
+    out.println("Protection is latched - 'power reset' first.");
+    return true;
+  }
+  SensorReading r = a.sensor.latest();
+  if (!r.valid || r.powerW < c.minTunePowerW || r.powerW > c.maxTunePowerW) {
+    out.printf("Key a steady carrier between %.0f and %.0f W first.\n", c.minTunePowerW,
+               c.maxTunePowerW);
+    return true;
+  }
+
+  if (a.relayPending || a.protectState != ProtectState::Clear) {
+    out.println("Relay changes are held or protection is active - try again shortly.");
+    return true;
+  }
+  const RelayState home = a.state;
+  RelayState other = home;
+  other.bypass = false;
+  // A large capacitance step changes the reflection clearly on any band.
+  uint8_t ci = cLadder().indexOf[other.cMask];
+  other.cMask = cLadder().maskAt[ci >= 64 ? ci - 48 : ci + 48];
+
+  static constexpr uint16_t kPairs = 600;
+  static TracePoint trace[kPairs];
+  uint32_t worstUs[2] = {0, 0};
+
+  for (int dir = 0; dir < 2; ++dir) {
+    const RelayState& to = (dir == 0) ? other : home;
+    a.sensor.startTrace(trace, kPairs);
+    delay(15);                          // pre-switch baseline
+    uint32_t switchUs = micros();
+    a.relays.apply(to);
+    a.state = to;
+    uint32_t t0 = millis();
+    while (!a.sensor.traceDone() && elapsed(t0) < 1500) delay(2);
+    if (!a.sensor.traceDone()) {
+      out.println("Trace timed out");
+      break;
+    }
+
+    // Final value: mean |Gamma| over the last 20% of the trace.
+    auto gammaAt = [&](const TracePoint& t) {
+      float vf = a.sensor.forwardCorrectedMv(t.fwdMv);
+      return vf >= c.swrMinForward ? a.sensor.reverseCorrectedMv(t.revMv) / vf : -1.0f;
+    };
+    float finalG = 0, startG = 0;
+    int nf = 0, ns = 0;
+    for (uint16_t i = kPairs * 4 / 5; i < kPairs; ++i) {
+      float g = gammaAt(trace[i]);
+      if (g >= 0) { finalG += g; ++nf; }
+    }
+    for (uint16_t i = 0; i < kPairs && trace[i].us < switchUs; ++i) {
+      float g = gammaAt(trace[i]);
+      if (g >= 0) { startG += g; ++ns; }
+    }
+    if (nf == 0 || ns == 0) {
+      out.println("RF dropped during the test");
+      break;
+    }
+    finalG /= nf;
+    startG /= ns;
+    float band = std::max(0.02f, 0.1f * std::fabs(finalG - startG));
+
+    uint32_t settledUs = 0;
+    for (uint16_t i = 0; i < kPairs; ++i) {
+      if (trace[i].us < switchUs) continue;
+      float g = gammaAt(trace[i]);
+      if (g < 0 || std::fabs(g - finalG) > band) settledUs = trace[i].us - switchUs;
+    }
+    worstUs[dir] = settledUs;
+    float spanMs = (trace[kPairs - 1].us - trace[0].us) / 1000.0f;
+    out.printf("%s: |Gamma| %.3f -> %.3f, settled in %.1f ms (trace %.0f ms, %.2f ms/pair)\n",
+               dir == 0 ? "Away " : "Back ", startG, finalG, settledUs / 1000.0f, spanMs,
+               spanMs / kPairs);
+  }
+
+  applyRelayState(home);
+  uint32_t worstMs = (std::max(worstUs[0], worstUs[1]) + 999) / 1000;
+  uint32_t recommend = worstMs + worstMs / 2 + 2;
+  out.printf("Current settle = %lu ms. Recommended: set settle %lu\n",
+             static_cast<unsigned long>(c.relaySettleMs), static_cast<unsigned long>(recommend));
   return true;
 }
 
@@ -615,7 +827,7 @@ inline bool cmdSweep(const char* args, Print& out) {
     return true;
   }
 
-  if (a.tuner.running()) {
+  if (a.tuner.running() || a.catTune.active()) {
     out.println("A tune is in progress. 'abort' first.");
     return true;
   }

@@ -11,6 +11,7 @@
 #include <Preferences.h>
 
 #include "Cat.h"
+#include "CatTune.h"
 #include "Config.h"
 #include "Controls.h"
 #include "Display.h"
@@ -36,9 +37,16 @@ struct RuntimeState {
 
 constexpr uint8_t kRuntimeStateVersion = 2;
 
+enum class ProtectState : uint8_t {
+  Clear,
+  WaitRfDrop,   // TX inhibit asserted, relays untouched until RF falls
+  Bypassed,     // RF fell, bypass engaged
+};
+
 struct App {
   SettingsStore settingsStore;
   RelayController relays;
+  TxLine tx;
   BridgeSensor sensor;
   Thermal thermal;
   CatInterface cat;
@@ -48,6 +56,7 @@ struct App {
   PowerProtection powerProt;
   TuningEngine tuner;
   SweepEngine sweep;
+  CatTuneSequencer catTune;
 
   DebouncedButton tuneButton;
   DebouncedButton bypassButton;
@@ -71,7 +80,25 @@ struct App {
   bool showingSweep = false;
   bool showingProtection = false;
   bool protectionLatched = false;
+  ProtectState protectState = ProtectState::Clear;
+  uint32_t protectSinceMs = 0;
+  bool protectHoldAnnounced = false;
   char protectionReason[24] = "";
+
+  // A relay change requested while RF was above pwrmax, applied once it drops.
+  bool relayPending = false;
+  RelayState pendingState;
+
+  // Release of the TX request line after a tune, without blocking the loop.
+  bool txReleasePending = false;
+  uint32_t txReleaseAtMs = 0;   // when the trail period started
+
+  // Relays only move once peak RF has stayed at or below pwrmax this long.
+  uint32_t rfQuietSinceMs = 0;
+
+  bool swrAlarm = false;
+  uint32_t swrHighSinceMs = 0;
+  uint32_t swrLowSinceMs = 0;
 
   // Set when a memory entry has already been tried for the current frequency,
   // so auto-retune escalates to a real tune instead of re-applying a stale
@@ -84,13 +111,22 @@ struct App {
 extern App gApp;
 
 // Implemented in main.cpp; used by both the console and the web UI.
-void applyRelayState(const RelayState& s);
-void setTxRequest(bool active);
+
+// Applies now if RF is at or below pwrmax, otherwise defers until it drops.
+// Returns true if the relays moved immediately.
+bool applyRelayState(const RelayState& s);
+// The state the relays are at, or are waiting to move to.
+RelayState desiredRelayState();
+bool rfSafeToSwitch();
+bool tuneAllowed(bool force);
 bool beginTune(bool force);
+bool startTuneFromButton();
+void abortActivity(const char* status);
 void engageProtection(const char* reason);
 void clearProtection();
 void saveRuntimeState();
 void selectAntenna(uint8_t index);
+void setStatus(const char* text);
 const char* displayKindName();
 
 }  // namespace atu

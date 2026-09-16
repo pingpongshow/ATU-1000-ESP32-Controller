@@ -37,6 +37,8 @@ struct UiModel {
   const char* status = "";
   bool powerWarning = false;
   bool powerOverload = false;
+  bool protectHold = false;     // overload latched, waiting for RF to drop
+  bool swrAlarm = false;
   bool tuning = false;
   uint8_t tunePercent = 0;
   bool tempValid = false;
@@ -151,9 +153,11 @@ class LcdDisplay : public IDisplay {
       // painted a full-screen overload page that the next 200 ms refresh
       // immediately wiped; the alarm now lives in the normal frame.
       const char* alarm = nullptr;
-      if (m.powerOverload) alarm = "!! OVERLOAD - BYPASS";
+      if (m.protectHold) alarm = "!! PROTECT - RF ON";
+      else if (m.powerOverload) alarm = "!! PROTECT - BYPASS";
       else if (m.tempLevel == ThermalLevel::Shutdown) alarm = "!! OVER TEMP - BYPASS";
       else if (m.tempLevel == ThermalLevel::Foldback) alarm = "! HOT - TX INHIBITED";
+      else if (m.swrAlarm) alarm = "! HIGH SWR";
       else if (m.powerWarning) alarm = "! POWER WARNING";
 
       if (alarm) {
@@ -216,8 +220,8 @@ class LcdDisplay : public IDisplay {
     lcd_.clear();
     writeLine(0, "!!! PROTECTION !!!");
     writeLine(1, reason);
-    if (rows_ > 2) writeLine(2, "BYPASS ENGAGED");
-    if (rows_ > 3) writeLine(3, "Reduce power / 'power reset'");
+    if (rows_ > 2) writeLine(2, "TX INHIBIT, BYPASS");
+    if (rows_ > 3) writeLine(3, "'power reset' clears");
   }
 
   void message(const char* l1, const char* l2) override {
@@ -474,9 +478,11 @@ class OledDisplay : public IDisplay {
     u8g2_->setFont(u8g2_font_5x7_tr);
 
     const char* alarm = nullptr;
-    if (m.powerOverload) alarm = "! OVERLOAD - BYPASS";
+    if (m.protectHold) alarm = "! PROTECT - RF STILL ON";
+    else if (m.powerOverload) alarm = "! PROTECT - BYPASS";
     else if (m.tempLevel == ThermalLevel::Shutdown) alarm = "! OVER TEMP - BYPASS";
     else if (m.tempLevel == ThermalLevel::Foldback) alarm = "! HOT - TX INHIBIT";
+    else if (m.swrAlarm) alarm = "! HIGH SWR";
     else if (m.powerWarning) alarm = "! POWER WARNING";
 
     if (alarm) {
@@ -589,7 +595,7 @@ class OledDisplay : public IDisplay {
     u8g2_->setFont(u8g2_font_helvR10_tr);
     centered(44, reason);
     u8g2_->setFont(u8g2_font_5x7_tr);
-    centered(58, "BYPASS ENGAGED");
+    centered(58, "TX INHIBIT + BYPASS");
     u8g2_->setDrawColor(1);
     u8g2_->sendBuffer();
   }

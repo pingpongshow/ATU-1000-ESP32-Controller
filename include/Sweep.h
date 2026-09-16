@@ -44,6 +44,7 @@ class SweepEngine {
     points_.reserve((endHz - startHz) / stepHz + 2);
     running_ = true;
     pending_ = false;
+    measuring_ = false;
     complete_ = false;
     lastStepMs_ = millis() - dwellMs_;
     return true;
@@ -53,6 +54,7 @@ class SweepEngine {
     if (!running_) return;
     running_ = false;
     pending_ = false;
+    measuring_ = false;
     restoreVfo();
   }
 
@@ -78,9 +80,23 @@ class SweepEngine {
       return;
     }
 
-    if (elapsed(settleStartMs_) < kRadioSettleMs) return;
+    if (!measuring_) {
+      if (elapsed(settleStartMs_) < kRadioSettleMs) return;
+      sensor_->requestMeasurement(16);
+      measureMs_ = millis();
+      measuring_ = true;
+      return;
+    }
 
-    SensorReading r = sensor_->readAverage(8, 2);
+    SensorReading r;
+    if (!sensor_->takeMeasurement(r)) {
+      if (elapsed(measureMs_) > 500) {   // superseded by another request
+        sensor_->requestMeasurement(16);
+        measureMs_ = millis();
+      }
+      return;
+    }
+    measuring_ = false;
     SweepPoint p;
     p.freqHz = currentHz_;
     p.swr = r.valid ? r.swr : 0.0f;
@@ -137,6 +153,8 @@ class SweepEngine {
 
   bool running_ = false;
   bool pending_ = false;
+  bool measuring_ = false;
+  uint32_t measureMs_ = 0;
   bool complete_ = false;
   uint32_t startHz_ = 0, endHz_ = 0, stepHz_ = 0, currentHz_ = 0;
   uint32_t restoreHz_ = 0;

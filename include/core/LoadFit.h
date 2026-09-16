@@ -43,7 +43,12 @@ class LoadFitter {
   void begin(uint32_t freqHz, const FitPoint* pts, size_t n) {
     freqHz_ = freqHz;
     n_ = 0;
-    for (size_t i = 0; i < n && n_ < kMaxPoints; ++i) pts_[n_++] = pts[i];
+    for (size_t i = 0; i < n && n_ < kMaxPoints; ++i) {
+      pts_[n_] = pts[i];
+      lUh_[n_] = maskToUh(pts[i].state.lMask);
+      cPf_[n_] = static_cast<float>(maskToPf(pts[i].state.cMask));
+      ++n_;
+    }
     row_ = 0;
     rawCount_ = 0;
     count_ = 0;
@@ -92,6 +97,8 @@ class LoadFitter {
 
   uint32_t freqHz_ = 0;
   FitPoint pts_[kMaxPoints];
+  float lUh_[kMaxPoints];
+  float cPf_[kMaxPoints];
   size_t n_ = 0;
   Stage stage_ = Stage::Done;
   int row_ = 0;
@@ -111,9 +118,11 @@ class LoadFitter {
 
   float cost(float u, float v, bool inv) const {
     Cplx z = zFrom(u, v);
+    const float f = static_cast<float>(freqHz_);
     float sum = 0.0f;
     for (size_t i = 0; i < n_; ++i) {
-      float d = modelGamma(freqHz_, pts_[i].state, inv, z) - pts_[i].gamma;
+      float d = modelGammaLC(f, lUh_[i], cPf_[i], pts_[i].state.topology, inv, z) -
+                pts_[i].gamma;
       sum += d * d;
     }
     return std::sqrt(sum / static_cast<float>(n_));
@@ -248,12 +257,15 @@ class MatchPlanner {
     }
     RelayState s;
     s.lMask = static_cast<uint8_t>(lMask_);
+    const float f = static_cast<float>(freqHz_);
+    const float lUh = maskToUh(s.lMask);
     for (int c = 0; c < kComboCount; ++c) {
       s.cMask = static_cast<uint8_t>(c);
+      const float cPf = cLadder().valueAt[cLadder().indexOf[c]];
       for (int t = 0; t < 2; ++t) {
         s.topology = (t == 1);
         for (size_t e = 0; e < nEst_; ++e) {
-          offer(e, s, modelGamma(freqHz_, s, est_[e].inverted, est_[e].z));
+          offer(e, s, modelGammaLC(f, lUh, cPf, s.topology, est_[e].inverted, est_[e].z));
         }
       }
     }

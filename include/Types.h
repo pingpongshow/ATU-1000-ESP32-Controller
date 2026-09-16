@@ -12,55 +12,29 @@
 #include <cstring>
 
 #include "Config.h"
+#include "RelayState.h"
 
 namespace atu {
-
-// -----------------------------------------------------------------------------
-// Relay / tuner state
-// -----------------------------------------------------------------------------
-
-struct RelayState {
-  uint8_t lMask = 0;
-  uint8_t cMask = 0;
-  bool topology = false;  // false = Lo-Z, true = Hi-Z
-  bool bypass = false;
-
-  bool operator==(const RelayState& o) const {
-    return lMask == o.lMask && cMask == o.cMask && topology == o.topology &&
-           bypass == o.bypass;
-  }
-  bool operator!=(const RelayState& o) const { return !(*this == o); }
-};
-
-enum RelayFlag : uint8_t {
-  FLAG_TOPOLOGY = 0x01,
-  FLAG_BYPASS = 0x02,
-};
-
-inline uint8_t packFlags(const RelayState& s) {
-  return static_cast<uint8_t>((s.topology ? FLAG_TOPOLOGY : 0) |
-                              (s.bypass ? FLAG_BYPASS : 0));
-}
-
-inline void unpackFlags(uint8_t flags, RelayState& s) {
-  s.topology = (flags & FLAG_TOPOLOGY) != 0;
-  s.bypass = (flags & FLAG_BYPASS) != 0;
-}
 
 // -----------------------------------------------------------------------------
 // Sensor
 // -----------------------------------------------------------------------------
 
-// swr is only meaningful when `valid` is true. When there is no detectable
-// forward power `valid` is false and swr/powerW are zeroed rather than being
-// left at a sentinel that the UI would happily draw as a full-scale bar.
+// swr and gamma are only meaningful when `valid` is true. When there is no
+// detectable forward power `valid` is false and swr/powerW are zeroed rather
+// than being left at a sentinel that the UI would happily draw as a full-scale
+// bar.
 struct SensorReading {
   float fwdMv = 0.0f;
   float revMv = 0.0f;
   float fwdRaw = 0.0f;
   float revRaw = 0.0f;
   float swr = 1.0f;
+  float gamma = 0.0f;       // |reflection coefficient|, median of per-pair ratios
+  float gammaNoise = 0.0f;  // standard error of `gamma`
   float powerW = 0.0f;
+  float peakPowerW = 0.0f;  // highest single-pair power in the reading
+  uint8_t pairs = 0;        // FWD/REV sample pairs behind this reading
   bool valid = false;
 };
 
@@ -73,6 +47,8 @@ struct SweepPoint {
 // -----------------------------------------------------------------------------
 // Results
 // -----------------------------------------------------------------------------
+
+enum class CarrierMode : uint8_t { Fm = 0, Am = 1, Cw = 2 };
 
 enum class TuneResult : uint8_t {
   None,
@@ -109,6 +85,7 @@ enum class CatProtocol : uint8_t {
   YaesuOld = 3, // Yaesu 5-byte binary (FT-817/857/897)
   YaesuNew = 4, // Yaesu newer ASCII (FTDX101 etc)
   None = 5,
+  Flex = 6,     // FlexRadio SmartSDR CAT (Kenwood-style plus ZZ extensions)
 };
 
 inline const char* catProtocolName(CatProtocol p) {
@@ -117,6 +94,7 @@ inline const char* catProtocolName(CatProtocol p) {
     case CatProtocol::Icom: return "Icom";
     case CatProtocol::YaesuOld: return "Yaesu";
     case CatProtocol::YaesuNew: return "YaesuN";
+    case CatProtocol::Flex: return "Flex";
     case CatProtocol::Auto: return "Auto";
     default: return "None";
   }
@@ -128,6 +106,7 @@ inline bool parseCatProtocol(const char* s, CatProtocol& out) {
   if (strcasecmp(s, "icom") == 0 || strcasecmp(s, "civ") == 0) { out = CatProtocol::Icom; return true; }
   if (strcasecmp(s, "yaesu") == 0 || strcasecmp(s, "yaesuold") == 0) { out = CatProtocol::YaesuOld; return true; }
   if (strcasecmp(s, "yaesun") == 0 || strcasecmp(s, "yaesunew") == 0) { out = CatProtocol::YaesuNew; return true; }
+  if (strcasecmp(s, "flex") == 0 || strcasecmp(s, "flexradio") == 0 || strcasecmp(s, "smartsdr") == 0) { out = CatProtocol::Flex; return true; }
   if (strcasecmp(s, "off") == 0 || strcasecmp(s, "none") == 0) { out = CatProtocol::None; return true; }
   return false;
 }
@@ -137,11 +116,6 @@ enum class DisplayKind : uint8_t {
   None = 1,
   Lcd = 2,
   Oled = 3,
-};
-
-enum class RelayMode : uint8_t {
-  Continuous = 0,  // coil energised for as long as the relay is selected
-  Pulsed = 1,      // coil driven for latchPulseMs then released (impulse relays)
 };
 
 // -----------------------------------------------------------------------------
