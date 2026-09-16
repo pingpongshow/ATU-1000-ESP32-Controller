@@ -55,11 +55,13 @@ Bypass mode is implemented in software by turning all L and C relays OFF.
 > octal PSRAM).
 
 > **Hot switching.** Bypass here is software-only: there is no physical bypass
-> relay, so protection opens the L and C banks while RF may still be present.
-> The firmware asserts the TX-request/inhibit line *before* it opens the relays
-> to give a radio that honours it a chance to unkey, but a kilowatt into a
-> switching relay bank will still arc the contacts. Wire the TX inhibit line if
-> your radio supports it.
+> relay. On an overload the firmware asserts the TX-request/inhibit line within
+> a few milliseconds, then waits for forward power to fall to `pwrmax` before
+> opening the relays. If RF does not drop it holds the current match rather
+> than switching the bank under power. That only ends the overload if something
+> stops the carrier, so wire the TX inhibit line if your radio or amplifier
+> supports it, or add the hardware trip described under
+> [Recommended hardware upgrades](#recommended-hardware-upgrades).
 
 ## ADC Inputs
 
@@ -146,6 +148,11 @@ board for a thermistor unless you give something else up.
 | 41 | TX Request | JTAG MTDI |
 | 42 | TX Request (inverted) | JTAG MTMS |
 
+The line is asserted around every tune and latched on by protection until
+`power reset`. It is most useful wired to a radio's or amplifier's TX inhibit /
+interlock input. If you do that, do not also use CAT tune: the tune asserts the
+line, which would stop the very carrier CAT tune keyed.
+
 GPIO 39-42 are the JTAG pins. They are ordinary GPIO unless you attach an
 external JTAG probe; the built-in USB-Serial-JTAG on GPIO 19/20 is unaffected.
 
@@ -179,7 +186,7 @@ GPIO 39, 40, 41, 42 - CAT and TX request
 - GPIO 48 - topology relay; **also the RGB LED on DevKitC-1 v1.0**
 
 ### Reserved / avoided
-- GPIO 19, 20 - native USB D-/D+ (and USB-Serial-JTAG)
+- GPIO 19, 20 - native USB D-/D+ (USB-Serial-JTAG; carries CAT passthrough when `catusb` is on)
 - GPIO 26-32 - SPI flash
 - GPIO 33-37 - octal PSRAM on -N8R8 / -N16R8 modules
 - GPIO 38 - RGB LED on DevKitC-1 v1.1 and later
@@ -238,8 +245,147 @@ GPIO Pin  ─────────────────► PIC Pin ──[
 | I2C SCL | 21 | - | New |
 | CAT RX | 39 | - | New |
 | CAT TX | 40 | - | New |
-| TX Request | 41 | - | New |
+| TX Request | 41 | - | New (see the CAT tune note below) |
 | TX Req Inv | 42 | - | New |
 | Temp sensor | 47/21 | - | Optional, on the I2C bus at 0x48-0x4F |
 | Antenna select | -1 | - | Optional, disabled by default |
 | NTC thermistor | -1 | - | Optional, needs a free ADC1 pin |
+
+## Recommended hardware upgrades
+
+None of these are needed to run the firmware, and the current firmware does not
+drive them yet. Each one fixes a limit of the stock board that software cannot
+fully fix. Pin suggestions assume the pin map above.
+
+**Free pins.** On a module **without** octal PSRAM, GPIO 35, 36 and 37 are free.
+On a DevKitC-1 v1.1 or later, GPIO 38 carries the RGB LED, and cutting that
+trace frees it. On an `-N8R8` / `-N16R8` module almost nothing is left, which is
+one more reason for the external ADC below: it frees GPIO 1 and 2.
+
+### 1. External ADC for the bridge
+
+**Problem.** The ESP32-S3's internal ADC gives roughly 9–10 effective bits, its
+calibration curve bends above about 2.5 V at 11 dB attenuation, and its readings
+are noisy. Power goes as voltage squared, so across a 1 W to 1 kW range the
+forward detector only swings about 32:1 in voltage. At tuning power the detector
+sits in the bottom few percent of the ADC's range, exactly where the SWR
+readings the tuner relies on are least accurate. The original PIC dealt with
+this by switching reference voltages; the ESP32 has no equivalent.
+
+**Fix.** An **ADS1115** (16-bit, programmable gain) on the existing I2C bus at
+0x48–0x4B. It needs no GPIO, and moving FWD/REV onto it frees GPIO 1 and 2. Use
+a gain of ±4.096 V at high power and ±1.024 V (4× the resolution) near tuning
+power; the gain can be switched per reading.
+
+- Wire detector FWD to AIN0 and REV to AIN1, single-ended, each through
+  1–10 kΩ with a 3.3 V clamp as described under ADC Inputs, plus 1 nF to ground
+  at the ADC pin.
+- The ADS1115 tops out at 860 samples/s, so about 400 FWD/REV pairs per second
+  when alternating. That is plenty for tuning, but too slow to be the only
+  overload detector, so pair it with upgrade 3.
+- ADDR pin: tie it so the address does not collide with an LM75 temperature
+  sensor. ADDR to VDD gives 0x49; move the LM75 to 0x4A–0x4F.
+- The ADS1015 is the 12-bit, 3300 samples/s part in the same package, if speed
+  matters more than resolution.
+
+For the widest dynamic range, replace the diode detectors with **AD8307**
+logarithmic detectors (about 90 dB range, output linear in dB). That is a
+bridge redesign, and the power and SWR maths would change to match.
+
+### 2. RF frequency counter
+
+**Problem.** Without CAT the tuner does not know the frequency, so it cannot
+recall memories and has to estimate the band from the load model, which takes
+more measurements. Many radios, and all amplifier-only setups, have no CAT.
+
+**Fix.** Count a divided-down RF sample on the ESP32-S3's pulse counter (PCNT).
+
+```
+RF sample ──[1-2 turns on the bridge toroid, or a 2 pF tap]──┬──[100 Ω]──┐
+                                                             │           │
+                                                      2x BAT54S clamp  74LVC1G14
+                                                        to 0 V / 3V3   Schmitt
+                                                                         │
+                                               74HC4040 ripple counter ◄─┘
+                                                         │ Q4 (÷16)
+                                                         ▼
+                                                   ESP32 GPIO (PCNT)
+```
+
+- Divide by 16 so 54 MHz becomes 3.4 MHz, comfortably inside what PCNT counts
+  reliably, even with its glitch filter enabled.
+- A 100 ms gate then resolves 160 Hz, far finer than the 25 kHz memory bins.
+- Keep the coupling light (a few volts at 1 kW) and the clamp diodes close to
+  the Schmitt input. The counter only needs to work above the tuner's minimum
+  tuning power.
+- Pin: GPIO 1 or 2 once the ADC moves to the ADS1115, or GPIO 35–38 as
+  available.
+
+### 3. Hardware overload trip
+
+**Problem.** Even at ~2 ms, the firmware trip depends on the firmware running.
+A crash, a watchdog reset or an OTA reboot is exactly when protection is absent.
+
+**Fix.** A comparator on the forward detector that drives TX inhibit directly
+and latches until the firmware clears it.
+
+```
+FWD detector ──┬───────────────► + TLV3201 / LM393 ──┐
+               │                                     │
+Vref (trimmer) ┴──────────────► −                    ▼
+                                            74LVC1G74 D-flip-flop (SET)
+                                                     │ Q
+                                  ┌──────────────────┼────────────────┐
+                                  ▼                  ▼                ▼
+                         2N7002 → TX inhibit   ESP32 GPIO (IRQ)   LED
+                                  ▲
+                    ESP32 GPIO ───┘ CLR (firmware reset after 'power reset')
+```
+
+- Set the threshold with the trimmer: at the limit power P, the detector reads
+  `Vf = 1000 · sqrt(P · pwrscale) / fwdscale + fwdoffset` mV.
+- Pull the flip-flop's CLR input low with a resistor so it powers up clear,
+  and pull its SET input up so it only trips on a real comparator edge.
+- The latch output ORs with GPIO 41 through the 2N7002, so either the firmware
+  or the hardware can inhibit TX, and a firmware fault cannot release a
+  hardware trip.
+- Pins: one input (trip interrupt) and one output (clear), from GPIO 35–38.
+
+### 4. Relay coil economiser
+
+**Problem.** With up to 15 relays energised, coil current is several hundred
+milliamps continuously. That heats the enclosure (which the temperature sensor
+then reports) and loads the supply.
+
+**Fix.** Switch the relay coil supply with a P-MOSFET under PWM. Drive it at
+100% for pull-in, then drop to a hold duty cycle.
+
+- High-side P-MOSFET (e.g. AO3401 for up to 12 V at about 1 A, or DMP3098L) on
+  the coil supply rail, gate pulled up to the rail, driven through an NPN or
+  2N7002 from an ESP32 LEDC output at 20–25 kHz, which is above audio and
+  harmless to HF.
+- Every coil must have a flyback diode. The PWM off-time current freewheels
+  through them. Check the board has them on every relay; add 1N4148s where it
+  does not.
+- Firmware sequence (to be added): 100% duty from any relay change until
+  `settle` + 20 ms, then 50–60% hold. Do not go below 50%. Hold voltage rises
+  with coil temperature, and a relay that drops out under power arcs.
+- Add 100 µF + 100 nF at the MOSFET's drain, and keep the PWM loop small.
+- Pin: one LEDC-capable output from GPIO 35–38.
+
+### 5. Pull-downs on the relay driver inputs
+
+**Problem.** During reset, flashing and OTA reboots, ESP32 pins float or briefly
+take strapping defaults. The MJD122's internal base resistors (about 8 kΩ and
+120 Ω) keep a floating base mostly off, but the RF choke in series with each
+base picks up RF. A relay chattering during a reboot with RF present is hot
+switching.
+
+**Fix.** A 10 kΩ resistor from each driver input (the ESP32 side of the RF
+choke) to ground: 15 resistors, or three 8-way 10 kΩ SIP networks. Add 1 nF
+across each resistor if RF pickup is a problem.
+
+Pull-downs cannot keep a tune through a reboot, because every relay releases
+while the ESP32 restarts. That is why firmware updates should never be done
+while transmitting.
+
