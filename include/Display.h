@@ -373,7 +373,11 @@ class OledDisplay : public IDisplay {
     if (!u8g2_) return false;
 
     u8g2_->setI2CAddress(static_cast<uint8_t>(addr_ << 1));
+    // U8g2's HW-I2C init calls Wire.begin() itself. Re-initialising a bus that
+    // is already running wedges the ESP32 core, so hand the bus over cleanly.
+    Wire.end();
     u8g2_->begin();
+    Wire.setTimeOut(50);
     u8g2_->setContrast(contrast_);
     u8g2_->setPowerSave(0);
     u8g2_->clearBuffer();

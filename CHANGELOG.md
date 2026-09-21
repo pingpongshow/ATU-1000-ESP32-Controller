@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.1.1
+
+### Fixes
+
+- **OLED no longer hangs the controller at boot.** U8g2's hardware-I2C
+  `begin()` re-initialises a bus that `DisplayManager` has already started,
+  which wedges the ESP32 core. Boot stopped inside `u8g2_->begin()` and never
+  reached thermal init, CAT or the console, so the tuner came up dead with a
+  blank panel. The bus is now released with `Wire.end()` before U8g2 takes it.
+  Affects any OLED build; the LCD path was never involved.
+- **`i2cscan` no longer wedges the controller.** `Wire::endTransmission()`
+  blocks indefinitely when SDA or SCL is held low - no pull-ups, an unpowered
+  panel, or a slave caught mid-byte after a reset. `feedLoopWDT()` kept the
+  watchdog quiet, so the console simply stopped responding until a hardware
+  reset. The scan now checks both lines are idle, attempts the standard
+  9-clock recovery, and aborts with a diagnostic instead of hanging.
+- **Default OLED driver is now SSD1306 (`oleddrv 1`).** The previous default of
+  SSD1309 NONAME2 leaves some 2.42"/4.2" panels dark. This only affects a fresh
+  chip or an NVS erase; a saved `oleddrv` is unchanged. Override with
+  `set oleddrv <0-2>` then `save`.
+
 ## v2.1
 
 After flashing this version, recalibrate the bridge and measure the relay

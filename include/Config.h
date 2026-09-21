@@ -17,7 +17,7 @@ namespace atu {
 
 constexpr uint8_t kAntennaPinCount = 3;
 
-constexpr const char* kFirmwareVersion = "2.1";
+constexpr const char* kFirmwareVersion = "2.1.1";
 
 struct Pins {
   int lRelays[kRelayCount];

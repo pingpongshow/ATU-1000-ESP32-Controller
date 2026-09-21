@@ -281,7 +281,10 @@ inline void settingsDefaults(Settings& s) {
   s.lcdCols = 20;
   s.lcdRows = 4;
   s.oledAddress = 0x3C;
-  s.oledDriver = 0;
+  // SSD1306 init. The SSD1309 sequences (0 and 2) leave some 2.42"/4.2" panels
+  // dark, and this one drives both controllers, so it is the safer default on
+  // a fresh chip or after an NVS erase. Override with `set oleddrv` + `save`.
+  s.oledDriver = 1;
   s.oledContrast = 255;
   s.dimAfterSec = 300;
   s.blankAfterSec = 0;

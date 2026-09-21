@@ -169,6 +169,51 @@ inline bool& memImportActive() {
   return active;
 }
 
+// I2C timeout used by the console probes, matching the display driver.
+constexpr uint16_t kI2cProbeTimeoutMs = 50;
+
+// Returns true when the bus is idle and safe to probe.
+//
+// Wire::endTransmission() can block indefinitely when a line is held low --
+// no pull-ups, an unpowered peripheral, or a slave caught mid-byte after the
+// ESP32 was reset. feedLoopWDT() keeps the watchdog quiet, so the controller
+// wedges silently with no console and no reboot. Check the lines first, try
+// the standard clock-pulse recovery, and refuse to scan if it stays stuck.
+inline bool i2cBusIdle(Print& out) {
+  const int sda = kPins.i2cSda;
+  const int scl = kPins.i2cScl;
+
+  if (digitalRead(sda) && digitalRead(scl)) return true;
+
+  out.printf("  Bus not idle: SDA=%s SCL=%s (both should be HIGH)\n",
+             digitalRead(sda) ? "HIGH" : "LOW",
+             digitalRead(scl) ? "HIGH" : "LOW");
+  out.println("  Attempting recovery (9 clock pulses)...");
+
+  Wire.end();
+  pinMode(sda, INPUT_PULLUP);
+  pinMode(scl, OUTPUT_OPEN_DRAIN);
+  digitalWrite(scl, HIGH);
+  for (int i = 0; i < 9 && !digitalRead(sda); ++i) {
+    digitalWrite(scl, LOW);
+    delayMicroseconds(5);
+    digitalWrite(scl, HIGH);
+    delayMicroseconds(5);
+  }
+  const bool recovered = digitalRead(sda) && digitalRead(scl);
+
+  Wire.begin(sda, scl);
+  Wire.setTimeOut(kI2cProbeTimeoutMs);
+
+  if (recovered) {
+    out.println("  Bus released.");
+  } else {
+    out.println("  Bus still held low - scan aborted.");
+    out.println("  Check wiring, 4.7k pull-ups, and that the display is powered.");
+  }
+  return recovered;
+}
+
 inline void handleCommand(const char* line, Print& out) {
   App& a = gApp;
   Settings& c = a.cfg();
@@ -408,6 +453,12 @@ inline void handleCommand(const char* line, Print& out) {
   if (!strcasecmp(line, "i2cscan")) {
     out.println("Scanning I2C bus...");
     out.printf("SDA=GPIO%d SCL=GPIO%d\n", kPins.i2cSda, kPins.i2cScl);
+    if (kPins.i2cSda < 0 || kPins.i2cScl < 0) {
+      out.println("  I2C pins are disabled in the pin map - nothing to scan.");
+      return;
+    }
+    if (!i2cBusIdle(out)) return;
+    Wire.setTimeOut(kI2cProbeTimeoutMs);
     uint8_t found = 0;
     for (uint8_t addr = 1; addr < 127; ++addr) {
       feedLoopWDT();   // a stuck bus can make each probe time out
